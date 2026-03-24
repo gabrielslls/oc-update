@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+#
+# oc-update - Manage OpenCode and Oh-My-OpenCode updates
+#
+# Usage:
+#   oc-update check [--oc|--omo]     # Check for updates (prompt to update)
+#   oc-update update [--oc|--omo]    # Update directly without prompt
+#   oc-update disable [oc|omo|all]   # Disable auto-update
+#   oc-update enable [oc|omo|all]    # Enable auto-update
+#   oc-update config                 # Show current config
+#   oc-update --help                 # Show help
+#
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+BOLD='\033[1m'
+
+# Package info
+OC_PKG="opencode-ai"
+OMO_PKG="oh-my-opencode"
+OC_NAME="OpenCode"
+OMO_NAME="Oh-My-OpenCode"
+OC_REPO="anomalyco/opencode"
+OMO_REPO="code-yeongyu/oh-my-openagent"
+
+# Config paths
+CONFIG_DIR="$HOME/.config/opencode"
+OC_CONFIG="$CONFIG_DIR/opencode.json"
+OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
+
+# Version
+VERSION="1.0.0"
+
+# Flags
+CHECK_OC=true
+CHECK_OMO=true
+
+# ============================================
+# Utilities
+# ============================================
+
+check_deps() {
+    local missing=()
+    command -v npm &> /dev/null || missing+=("npm")
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${RED}错误: 缺少必要依赖: ${missing[*]}${NC}"
+        echo "请安装上述工具后再运行 $0"
+        exit 1
+    fi
+}
+
+has_jq() {
+    command -v jq &> /dev/null
+}
+
+
+get_oc_autoupdate() {
+    if [[ -f "$OC_CONFIG" ]]; then
+        if has_jq; then
+            jq -r '.autoupdate // false' "$OC_CONFIG" 2>/dev/null
+        else
+            grep -o '"autoupdate"[[:space:]]*:[[:space:]]*[^,}]*' "$OC_CONFIG" 2>/dev/null | \
+                sed 's/.*:[[:space:]]*//' | tr -d ' ",' | head -1
+        fi
+    else
+        echo "not-found"
+    fi
+}
+
+get_omo_auto_update() {
+    if [[ -f "$OMO_CONFIG" ]]; then
+        if has_jq; then
+            jq -r '.auto_update // false' "$OMO_CONFIG" 2>/dev/null
+        else
+            grep -o '"auto_update"[[:space:]]*:[[:space:]]*[^,}]*' "$OMO_CONFIG" 2>/dev/null | \
+                sed 's/.*:[[:space:]]*//' | tr -d ' ",' | head -1
+        fi
+    else
+        echo "not-found"
+    fi
+}
+
+is_omo_hook_disabled() {
+    if [[ -f "$OMO_CONFIG" ]]; then
+        if has_jq; then
+            jq -e '.disabled_hooks[] | select(. == "auto-update-checker")' "$OMO_CONFIG" &>/dev/null
+            return $?
+        else
+            grep -q '"auto-update-checker"' "$OMO_CONFIG" 2>/dev/null
+            return $?
+        fi
+    fi
+    return 1
+}
+
+set_oc_autoupdate() {
+    local value="$1"
+    [[ ! -f "$OC_CONFIG" ]] && { echo -e "${RED}✗ 配置文件不存在: $OC_CONFIG${NC}"; return 1; }
+    if has_jq; then
+        local tmp; tmp=$(mktemp)
+        jq --arg v "$value" '.autoupdate = ($v | if $v == "true" then true elif $v == "false" then false else $v end)' \
+            "$OC_CONFIG" > "$tmp" && mv "$tmp" "$OC_CONFIG"
+    else
+        sed -i "s/\"autoupdate\"[[:space:]]*:[[:space:]]*[^,}]*/\"autoupdate\": $value/" "$OC_CONFIG"
+    fi
+}
+
+set_omo_auto_update() {
+    local value="$1"
+    [[ ! -f "$OMO_CONFIG" ]] && { echo -e "${RED}✗ 配置文件不存在: $OMO_CONFIG${NC}"; return 1; }
+    if has_jq; then
+        local tmp; tmp=$(mktemp)
+        jq --argjson v "$value" '.auto_update = $v' "$OMO_CONFIG" > "$tmp" && mv "$tmp" "$OMO_CONFIG"
+    else
+        sed -i "s/\"auto_update\"[[:space:]]*:[[:space:]]*[^,}]*/\"auto_update\": $value/" "$OMO_CONFIG"
+    fi
+}
+
+add_omo_disabled_hook() {
+    [[ ! -f "$OMO_CONFIG" ]] && return 1
+    is_omo_hook_disabled && return 0
+    if has_jq; then
+        local tmp; tmp=$(mktemp)
+        jq '.disabled_hooks = (.disabled_hooks // []) + ["auto-update-checker"]' "$OMO_CONFIG" > "$tmp" && mv "$tmp" "$OMO_CONFIG"
+    else
+        sed -i 's/"disabled_hooks"[[:space:]]*:[[:space:]]*\[/&"auto-update-checker", /' "$OMO_CONFIG"
+    fi
+}
+
+remove_omo_disabled_hook() {
+    [[ ! -f "$OMO_CONFIG" ]] && return 1
+    if has_jq; then
+        local tmp; tmp=$(mktemp)
+        jq '.disabled_hooks = [.disabled_hooks[] | select(. != "auto-update-checker")]' "$OMO_CONFIG" > "$tmp" && mv "$tmp" "$OMO_CONFIG"
+    else
+        sed -i 's/"auto-update-checker"[[:space:]]*,[[:space:]]*//' "$OMO_CONFIG"
+        sed -i 's/,[[:space:]]*"auto-update-checker"//' "$OMO_CONFIG"
+    fi
+}
+
+is_oc_disabled() {
+    local val; val=$(get_oc_autoupdate)
+    [[ "$val" == "false" ]] || [[ -n "${OPENCODE_DISABLE_AUTOUPDATE:-}" ]]
+}
+
+is_omo_disabled() {
+    local val; val=$(get_omo_auto_update)
+    [[ "$val" == "false" ]] || is_omo_hook_disabled
+}
+
+# ============================================
+# Version operations
+# ============================================
+
+get_local_version() {
+    local pkg="$1"
+    local pkg_path="$HOME/.local/lib/node_modules/$pkg/package.json"
+    if [[ -f "$pkg_path" ]]; then
+        grep '"version"' "$pkg_path" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/'
+    else
+        echo "not-installed"
+    fi
+}
+
+get_remote_version() {
+    npm view "$1" version 2>/dev/null || echo "unknown"
+}
+
+needs_update() {
+    local local_ver="$1" remote_ver="$2"
+    [[ "$local_ver" == "not-installed" ]] || [[ "$local_ver" != "$remote_ver" ]]
+}
+
+get_changelog() {
+    local repo="$1"
+    # 临时禁用 set -e，防止 gh 命令失败导致脚本退出
+    local set_e_state=false
+    [[ $- == *e* ]] && set_e_state=true
+    set +e
+
+    if command -v gh &> /dev/null; then
+        # Check if logged in
+        if gh auth status &>/dev/null; then
+            # 尝试获取 release
+            local body
+            body=$(gh release view --repo "$repo" --json body 2>&1)
+            if [[ $? -eq 0 ]]; then
+                body=$(echo "$body" | jq -r '.body // empty' 2>/dev/null)
+                if [[ -n "$body" ]]; then
+                    echo "$body" | head -20
+                    $set_e_state && set -e
+                    return
+                fi
+            fi
+            # 尝试获取 commits
+            local commits
+            commits=$(gh api "repos/$repo/commits" -q '.[:8] | .[] | "• \(.commit.message | split("\n")[0])"' 2>/dev/null)
+            if [[ $? -eq 0 && -n "$commits" ]]; then
+                echo "$commits"
+                $set_e_state && set -e
+                return
+            fi
+        fi
+    fi
+
+    # 恢复 set -e 状态
+    $set_e_state && set -e
+    echo "  (更新日志获取失败，请访问 GitHub 查看)"
+}
+
+update_package() {
+    local pkg="$1" name="$2" ver="$3"
+    echo -e "${CYAN}正在更新 $name 到 $ver...${NC}"
+    if npm install -g "$pkg" 2>&1; then
+        echo -e "${GREEN}✓ $name 更新成功${NC}"
+    else
+        echo -e "${RED}✗ $name 更新失败${NC}"
+        return 1
+    fi
+}
+
+# ============================================
+# Commands
+# ============================================
+
+show_config() {
+    echo ""
+    echo -e "${BOLD}当前配置${NC}"
+    echo "─────────────────────────────────────"
+    
+    # OpenCode
+    local oc_auto; oc_auto=$(get_oc_autoupdate)
+    echo -e "${BOLD}OpenCode:${NC}"
+    case "$oc_auto" in
+        "true")   echo -e "  autoupdate: ${GREEN}true${NC}" ;;
+        "false")  echo -e "  autoupdate: ${RED}false${NC}" ;;
+        "notify") echo -e "  autoupdate: ${YELLOW}notify${NC}" ;;
+        *)        echo -e "  autoupdate: ${BLUE}$oc_auto${NC}" ;;
+    esac
+    [[ -n "${OPENCODE_DISABLE_AUTOUPDATE:-}" ]] && echo -e "  ${YELLOW}⚠ OPENCODE_DISABLE_AUTOUPDATE 已设置${NC}"
+    
+    echo ""
+    
+    # Oh-My-OpenCode
+    local omo_auto; omo_auto=$(get_omo_auto_update)
+    echo -e "${BOLD}Oh-My-OpenCode:${NC}"
+    case "$omo_auto" in
+        "true")  echo -e "  auto_update: ${GREEN}true${NC}" ;;
+        "false") echo -e "  auto_update: ${RED}false${NC}" ;;
+        *)       echo -e "  auto_update: ${BLUE}$omo_auto${NC}" ;;
+    esac
+    if is_omo_hook_disabled; then
+        echo -e "  disabled_hooks: ${RED}包含 \"auto-update-checker\"${NC}"
+    else
+        echo -e "  disabled_hooks: ${GREEN}不包含 \"auto-update-checker\"${NC}"
+    fi
+    echo ""
+}
+
+do_check() {
+    local has_update=false
+    local pkgs_to_update=()
+    local vers_to_update=()
+    local names_to_update=()
+    
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  📦 版本检查${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # Check OC
+    if [[ "$CHECK_OC" == true ]]; then
+        echo -e "${BOLD}OpenCode${NC} ($OC_PKG)"
+        echo "─────────────────────────────────────"
+        
+        local local_ver remote_ver
+        local_ver=$(get_local_version "$OC_PKG")
+        remote_ver=$(get_remote_version "$OC_PKG")
+        
+        echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${CYAN}$remote_ver${NC}"
+        
+        if needs_update "$local_ver" "$remote_ver"; then
+            echo -e "${YELLOW}  🆕 有更新${NC}"
+            has_update=true
+            pkgs_to_update+=("$OC_PKG")
+            vers_to_update+=("$remote_ver")
+            names_to_update+=("$OC_NAME")
+            
+            echo ""
+            echo -e "${BOLD}  更新内容:${NC}"
+            get_changelog "$OC_REPO" | sed 's/^/    /'
+        else
+            echo -e "${GREEN}  ✓ 已是最新${NC}"
+        fi
+        echo ""
+    fi
+    
+    # Check OMO
+    if [[ "$CHECK_OMO" == true ]]; then
+        echo -e "${BOLD}Oh-My-OpenCode${NC} ($OMO_PKG)"
+        echo "─────────────────────────────────────"
+        
+        local local_ver remote_ver
+        local_ver=$(get_local_version "$OMO_PKG")
+        remote_ver=$(get_remote_version "$OMO_PKG")
+        
+        echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${CYAN}$remote_ver${NC}"
+        
+        if needs_update "$local_ver" "$remote_ver"; then
+            echo -e "${YELLOW}  🆕 有更新${NC}"
+            has_update=true
+            pkgs_to_update+=("$OMO_PKG")
+            vers_to_update+=("$remote_ver")
+            names_to_update+=("$OMO_NAME")
+            
+            echo ""
+            echo -e "${BOLD}  更新内容:${NC}"
+            get_changelog "$OMO_REPO" | sed 's/^/    /'
+        else
+            echo -e "${GREEN}  ✓ 已是最新${NC}"
+        fi
+        echo ""
+    fi
+    
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Ask to update
+    if [[ "$has_update" == true ]]; then
+        echo ""
+        echo -e "${BOLD}发现 ${#pkgs_to_update[@]} 个可更新的包${NC}"
+        echo ""
+        
+        for i in "${!pkgs_to_update[@]}"; do
+            echo -n "  更新 ${names_to_update[$i]}? [y/N] "
+            read -r answer
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                update_package "${pkgs_to_update[$i]}" "${names_to_update[$i]}" "${vers_to_update[$i]}"
+            else
+                echo -e "  ${BLUE}跳过${NC}"
+            fi
+        done
+        echo ""
+    fi
+}
+
+do_update() {
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  📦 直接更新${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    if [[ "$CHECK_OC" == true ]]; then
+        local ver; ver=$(get_remote_version "$OC_PKG")
+        update_package "$OC_PKG" "$OC_NAME" "$ver"
+    fi
+    
+    if [[ "$CHECK_OMO" == true ]]; then
+        local ver; ver=$(get_remote_version "$OMO_PKG")
+        update_package "$OMO_PKG" "$OMO_NAME" "$ver"
+    fi
+    echo ""
+}
+
+do_disable() {
+    local target="$1"
+    case "$target" in
+        oc|opencode)
+            echo -e "${BOLD}禁用 OpenCode 自动更新...${NC}"
+            set_oc_autoupdate "false"
+            echo -e "${GREEN}✓ autoupdate = false${NC}"
+            ;;
+        omo|oh-my-opencode)
+            echo -e "${BOLD}禁用 Oh-My-OpenCode 自动更新...${NC}"
+            set_omo_auto_update "false"
+            add_omo_disabled_hook
+            echo -e "${GREEN}✓ auto_update = false${NC}"
+            echo -e "${GREEN}✓ disabled_hooks 包含 \"auto-update-checker\"${NC}"
+            ;;
+        all|both|"")
+            echo -e "${BOLD}禁用所有自动更新...${NC}"
+            set_oc_autoupdate "false"
+            set_omo_auto_update "false"
+            add_omo_disabled_hook
+            echo -e "${GREEN}✓ 已禁用所有自动更新${NC}"
+            ;;
+        *)
+            echo -e "${RED}Unknown: $target${NC}"
+            echo "Usage: oc-update disable [oc|omo|all]"
+            exit 1
+            ;;
+    esac
+}
+
+do_enable() {
+    local target="$1"
+    case "$target" in
+        oc|opencode)
+            echo -e "${BOLD}启用 OpenCode 自动更新...${NC}"
+            set_oc_autoupdate "true"
+            echo -e "${GREEN}✓ autoupdate = true${NC}"
+            ;;
+        omo|oh-my-opencode)
+            echo -e "${BOLD}启用 Oh-My-OpenCode 自动更新...${NC}"
+            set_omo_auto_update "true"
+            remove_omo_disabled_hook
+            echo -e "${GREEN}✓ auto_update = true${NC}"
+            echo -e "${GREEN}✓ 已移除 \"auto-update-checker\" hook${NC}"
+            ;;
+        all|both|"")
+            echo -e "${BOLD}启用所有自动更新...${NC}"
+            set_oc_autoupdate "true"
+            set_omo_auto_update "true"
+            remove_omo_disabled_hook
+            echo -e "${GREEN}✓ 已启用所有自动更新${NC}"
+            ;;
+        *)
+            echo -e "${RED}Unknown: $target${NC}"
+            echo "Usage: oc-update enable [oc|omo|all]"
+            exit 1
+            ;;
+    esac
+}
+
+show_help() {
+    cat << 'EOF'
+Usage: oc-update <command> [options]
+
+Commands:
+  check [--oc|--omo]     检查更新，询问是否更新
+  update [--oc|--omo]    直接更新，不询问
+  disable [oc|omo|all]   禁用自动更新检查
+  enable [oc|omo|all]    启用自动更新检查
+  config                 显示当前配置
+
+Options:
+  --oc          仅操作 OpenCode
+  --omo         仅操作 Oh-My-OpenCode
+  -v, --version 显示版本号
+  -h, --help    显示帮助信息
+
+Examples:
+  oc-update check          # 检查所有，询问是否更新
+  oc-update update         # 直接更新所有
+  oc-update check --oc     # 仅检查 OpenCode
+  oc-update disable all    # 禁用所有自动更新
+  oc-update enable omo     # 启用 OMO 自动更新
+EOF
+}
+
+# ============================================
+# Main
+# ============================================
+
+main() {
+    check_deps
+    local cmd="${1:-}"
+    
+    # Parse global options first
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --oc)  CHECK_OMO=false; shift ;;
+            --omo) CHECK_OC=false; shift ;;
+            -h|--help) show_help; exit 0 ;;
+            -v|--version) echo "oc-update v$VERSION"; exit 0 ;;
+            *) break ;;
+        esac
+    done
+
+    
+    case "$cmd" in
+        check)
+            do_check
+            ;;
+        update)
+            do_update
+            ;;
+        disable)
+            do_disable "${1:-all}"
+            ;;
+        enable)
+            do_enable "${1:-all}"
+            ;;
+        config)
+            show_config
+            ;;
+        -h|--help|"")
+            show_help
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

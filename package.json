@@ -1,0 +1,28 @@
+{
+  "name": "oc-update",
+  "version": "1.0.0",
+  "description": "OpenCode and Oh-My-OpenCode version management tool",
+  "bin": {
+    "oc-update": "./bin/oc-update"
+  },
+  "scripts": {
+    "test": "shellcheck bin/oc-update"
+  },
+  "keywords": [
+    "opencode",
+    "oh-my-opencode",
+    "update",
+    "version",
+    "cli"
+  ],
+  "author": "gabrielslls",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gabrielslls/oc-update.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gabrielslls/oc-update/issues"
+  },
+  "homepage": "https://github.com/gabrielslls/oc-update#readme"
+}
