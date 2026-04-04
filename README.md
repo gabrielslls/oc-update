@@ -8,6 +8,8 @@ OpenCode 和 Oh-My-OpenCode 版本管理工具。
 - **交互式更新**: 检查后询问是否更新
 - **直接更新**: 跳过询问直接更新
 - **自动更新管理**: 启用/禁用 OC/OMO 的自动更新检查
+- **多包管理器支持**: 自动检测 npm/pnpm/yarn/bun
+- **智能路径发现**: 自动定位实际运行的版本
 
 ## 安装
 
@@ -20,7 +22,6 @@ npm install -g gabrielslls/oc-update
 # 或者本地安装
 npm install -g .
 ```
-
 
 ## 用法
 
@@ -40,7 +41,46 @@ oc-update enable all     # 启用自动更新检查
 oc-update enable oc      # 仅启用 OpenCode 自动更新
 oc-update enable omo     # 仅启用 Oh-My-OpenCode 自动更新
 
-oc-update config         # 显示当前配置
+oc-update config         # 显示当前配置和安装路径
+```
+
+## 特性详解
+
+### 多包管理器支持
+
+自动检测并使用正确的包管理器：
+
+| 包管理器 | 检测方式 |
+|----------|----------|
+| npm | 默认 |
+| pnpm | `pnpm list -g` 成功 |
+| yarn | `yarn global list` 包含目标包 |
+| bun | `~/.bun/install/global` 存在 |
+
+### 智能路径发现
+
+当存在多个安装位置时，脚本会按以下优先级定位实际运行的版本：
+
+1. **命令路径反推**: 解析 `command -v opencode` 的符号链接，找到实际运行的版本
+2. **npm list 查询**: 使用 `npm list -g --parseable` 获取安装路径
+3. **常见路径搜索**: 搜索 `~/.local`、NVM、fnm、bun、系统级等常见位置
+
+支持的安装位置：
+
+- `~/.local/lib/node_modules` (手动安装)
+- `~/.nvm/versions/node/*/lib/node_modules` (NVM)
+- `~/.fnm/node-versions/*/installation/lib/node_modules` (fnm)
+- `~/.bun/install/global/node_modules` (bun)
+- `/usr/local/lib/node_modules` (系统级)
+- `/usr/lib/node_modules` (Debian 系统级)
+
+### 更新验证
+
+更新后自动验证版本，如果版本不匹配会提示：
+```
+⚠ 更新完成，但版本验证失败
+  预期: 1.3.13, 实际: 1.3.7
+  可能需要重新登录或运行 'hash -r' 刷新 PATH 缓存
 ```
 
 ## 配置文件
@@ -76,6 +116,8 @@ oc-update config         # 显示当前配置
 
 ## 示例输出
 
+### 版本检查
+
 ```
 $ oc-update check
 
@@ -102,9 +144,33 @@ Oh-My-OpenCode (oh-my-opencode)
 发现 1 个可更新的包
 
   更新 OpenCode? [y/N] y
-正在更新 OpenCode 到 1.2.25...
-✓ OpenCode 更新成功
+  检测到包管理器: npm
+  执行: npm install --prefix /home/user/.local -g opencode-ai
+✓ OpenCode 更新成功 (v1.2.25)
 ```
+
+### 配置查看
+
+```
+$ oc-update config
+
+当前配置
+─────────────────────────────────────
+OpenCode:
+  autoupdate: false
+  包管理器: npm
+  安装路径: /home/user/.local/lib/node_modules/opencode-ai
+
+Oh-My-OpenCode:
+  auto_update: false
+  包管理器: npm
+  安装路径: /home/user/.nvm/versions/node/v20.20.2/lib/node_modules/oh-my-opencode
+  disabled_hooks: 包含 "auto-update-checker"
+```
+
+## Changelog
+
+见 [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 

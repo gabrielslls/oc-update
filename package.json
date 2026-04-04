@@ -1,6 +1,6 @@
 {
   "name": "oc-update",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenCode and Oh-My-OpenCode version management tool",
   "bin": {
     "oc-update": "./bin/oc-update"

@@ -36,7 +36,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Flags
 CHECK_OC=true
@@ -160,11 +160,116 @@ is_omo_disabled() {
 # Version operations
 # ============================================
 
+# 检测包管理器类型
+detect_package_manager() {
+    # 检查是否在 pnpm 环境中
+    if command -v pnpm &>/dev/null && pnpm list -g "$1" &>/dev/null 2>&1; then
+        echo "pnpm"
+        return
+    fi
+    # 检查是否在 yarn 环境中
+    if command -v yarn &>/dev/null && yarn global list --pattern "$1" 2>/dev/null | grep -q "$1"; then
+        echo "yarn"
+        return
+    fi
+    # 检查是否在 bun 环境中
+    if command -v bun &>/dev/null && [[ -f "$HOME/.bun/install/global/node_modules/$1/package.json" ]]; then
+        echo "bun"
+        return
+    fi
+    # 默认 npm
+    echo "npm"
+}
+
+# 查找包的实际安装路径
+find_package_path() {
+    local pkg="$1"
+    local found_path=""
+    
+    # 方法 1: 通过命令路径反推（优先级最高，这是实际运行的版本）
+    local cmd_name="$pkg"
+    [[ "$pkg" == "opencode-ai" ]] && cmd_name="opencode"
+    [[ "$pkg" == "oh-my-opencode" ]] && cmd_name="omo"
+    
+    local cmd_path=$(command -v "$cmd_name" 2>/dev/null)
+    if [[ -n "$cmd_path" ]]; then
+        # 解析符号链接
+        if [[ -L "$cmd_path" ]]; then
+            cmd_path=$(readlink -f "$cmd_path" 2>/dev/null || readlink "$cmd_path")
+        fi
+        # 从 bin/opencode 反推 node_modules 路径
+        if [[ "$cmd_path" == */bin/* ]]; then
+            local pkg_dir
+            pkg_dir=$(dirname "$(dirname "$cmd_path")")
+            # pkg_dir 可能是 .../node_modules/opencode-ai 或 .../node_modules/包名
+            if [[ -f "$pkg_dir/package.json" ]]; then
+                echo "$pkg_dir"
+                return
+            fi
+        fi
+    fi
+    
+    # 方法 2: 通过 npm list 获取
+    if command -v npm &>/dev/null; then
+        found_path=$(npm list -g "$pkg" --depth=0 --parseable 2>/dev/null | head -1)
+        if [[ -n "$found_path" && -f "$found_path/package.json" ]]; then
+            echo "$found_path"
+            return
+        fi
+    fi
+    
+    # 方法 3: 检查常见位置（按优先级）
+    local search_paths=(
+        "$HOME/.local/lib/node_modules/$pkg"                           # 手动安装
+        "$HOME/.bun/install/global/node_modules/$pkg"                  # bun
+        "$(npm root -g 2>/dev/null)/$pkg"                              # npm 全局
+        "$HOME/.yarn/global/node_modules/$pkg"                         # yarn global
+        "/usr/local/lib/node_modules/$pkg"                             # 系统级
+        "/usr/lib/node_modules/$pkg"                                   # 系统级 (Debian)
+    )
+    
+    # NVM 路径（动态）
+    if [[ -d "$HOME/.nvm/versions/node" ]]; then
+        for nvm_dir in "$HOME/.nvm/versions/node"/*/lib/node_modules; do
+            search_paths+=("$nvm_dir/$pkg")
+        done
+    fi
+    
+    # fnm 路径
+    if [[ -d "$HOME/.fnm/node-versions" ]]; then
+        for fnm_dir in "$HOME/.fnm/node-versions"/*/installation/lib/node_modules; do
+            search_paths+=("$fnm_dir/$pkg")
+        done
+    fi
+    
+    for p in "${search_paths[@]}"; do
+        if [[ -f "$p/package.json" ]]; then
+            echo "$p"
+            return
+        fi
+    done
+    
+    echo ""
+}
+
+# 获取包管理器的全局根目录
+get_global_root() {
+    local pm="$1"
+    case "$pm" in
+        pnpm) pnpm root -g 2>/dev/null ;;
+        yarn) yarn global dir 2>/dev/null ;;
+        bun)  echo "$HOME/.bun/install/global/node_modules" ;;
+        *)    npm root -g 2>/dev/null ;;
+    esac
+}
+
 get_local_version() {
     local pkg="$1"
-    local pkg_path="$HOME/.local/lib/node_modules/$pkg/package.json"
-    if [[ -f "$pkg_path" ]]; then
-        grep '"version"' "$pkg_path" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/'
+    local pkg_path
+    pkg_path=$(find_package_path "$pkg")
+    
+    if [[ -n "$pkg_path" && -f "$pkg_path/package.json" ]]; then
+        grep '"version"' "$pkg_path/package.json" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/'
     else
         echo "not-installed"
     fi
@@ -181,11 +286,12 @@ needs_update() {
 
 get_changelog() {
     local repo="$1"
-    # 临时禁用 set -e，防止 gh 命令失败导致脚本退出
+    # 临时禁用 set -e，防止命令失败导致脚本退出
     local set_e_state=false
     [[ $- == *e* ]] && set_e_state=true
     set +e
 
+    # 方法 1: 使用 gh CLI
     if command -v gh &> /dev/null; then
         # Check if logged in
         if gh auth status &>/dev/null; then
@@ -211,20 +317,138 @@ get_changelog() {
         fi
     fi
 
+    # 方法 2: 使用 curl + GitHub API（无需认证）
+    if command -v curl &> /dev/null; then
+        # 尝试获取最新 release
+        local release_json
+        release_json=$(curl -s "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
+        if [[ -n "$release_json" ]]; then
+            local body
+            if command -v jq &> /dev/null; then
+                body=$(echo "$release_json" | jq -r '.body // empty' 2>/dev/null)
+            else
+                body=$(echo "$release_json" | grep -o '"body"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"body"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//' | head -1)
+            fi
+            if [[ -n "$body" && "$body" != "null" ]]; then
+                echo "$body" | head -20
+                $set_e_state && set -e
+                return
+            fi
+        fi
+
+        # 尝试获取最近 commits
+        local commits_json
+        commits_json=$(curl -s "https://api.github.com/repos/$repo/commits?per_page=8" 2>/dev/null)
+        if [[ -n "$commits_json" ]]; then
+            if command -v jq &> /dev/null; then
+                echo "$commits_json" | jq -r '.[] | "• \(.commit.message | split("\n")[0])"' 2>/dev/null
+                if [[ $? -eq 0 ]]; then
+                    $set_e_state && set -e
+                    return
+                fi
+            else
+                # 简单解析 commit messages
+                echo "$commits_json" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"message"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//' | head -8 | while read -r line; do
+                    echo "• $line"
+                done
+                $set_e_state && set -e
+                return
+            fi
+        fi
+    fi
+
     # 恢复 set -e 状态
     $set_e_state && set -e
     echo "  (更新日志获取失败，请访问 GitHub 查看)"
 }
 
 update_package() {
-    local pkg="$1" name="$2" ver="$3"
-    echo -e "${CYAN}正在更新 $name 到 $ver...${NC}"
-    if npm install -g "$pkg" 2>&1; then
-        echo -e "${GREEN}✓ $name 更新成功${NC}"
+    local pkg="$1" name="$2" expected_ver="$3"
+    echo -e "${CYAN}正在更新 $name 到 $expected_ver...${NC}"
+    
+    # 检测包管理器
+    local pm
+    pm=$(detect_package_manager "$pkg")
+    echo -e "  ${BLUE}检测到包管理器: $pm${NC}"
+    
+    # 查找当前安装路径
+    local pkg_path
+    pkg_path=$(find_package_path "$pkg")
+    
+    local install_cmd=""
+    local success=true
+    
+    case "$pm" in
+        pnpm)
+            if [[ -n "$pkg_path" ]]; then
+                # pnpm 全局更新
+                install_cmd="pnpm update -g $pkg"
+            else
+                install_cmd="pnpm add -g $pkg"
+            fi
+            ;;
+        yarn)
+            install_cmd="yarn global add $pkg"
+            ;;
+        bun)
+            install_cmd="bun add -g $pkg"
+            ;;
+        npm|*)
+            # npm: 需要确定安装位置
+            if [[ -n "$pkg_path" ]]; then
+                # 从包路径提取安装根目录
+                local install_root
+                install_root=$(dirname "$pkg_path")
+                
+                # 检查是否是 ~/.local 或其他需要 --prefix 的位置
+                if [[ "$install_root" == "$HOME/.local/lib/node_modules" ]]; then
+                    install_cmd="npm install --prefix $HOME/.local -g $pkg"
+                elif [[ "$install_root" == *"/.bun/"* ]]; then
+                    # bun 管理的，用 bun 更新
+                    install_cmd="bun update -g $pkg"
+                    pm="bun"
+                else
+                    # NVM 或系统级，直接 npm install -g
+                    install_cmd="npm install -g $pkg"
+                fi
+            else
+                # 未安装，使用默认全局安装
+                install_cmd="npm install -g $pkg"
+            fi
+            ;;
+    esac
+    
+    echo -e "  ${BLUE}执行: $install_cmd${NC}"
+    
+    if eval "$install_cmd" 2>&1; then
+        # 验证更新
+        sleep 1  # 等待文件系统同步
+        local actual_ver
+        actual_ver=$(get_local_version "$pkg")
+        
+        if [[ "$actual_ver" == "$expected_ver" ]]; then
+            echo -e "${GREEN}✓ $name 更新成功 (v$actual_ver)${NC}"
+        else
+            echo -e "${YELLOW}⚠ 更新完成，但版本验证失败${NC}"
+            echo -e "  预期: $expected_ver, 实际: $actual_ver"
+            echo -e "  可能需要重新登录或运行 'hash -r' 刷新 PATH 缓存"
+            success=false
+        fi
     else
         echo -e "${RED}✗ $name 更新失败${NC}"
         return 1
     fi
+    
+    # 显示实际使用的 opencode 路径
+    if [[ "$pkg" == "opencode-ai" ]]; then
+        local actual_path
+        actual_path=$(command -v opencode 2>/dev/null)
+        if [[ -n "$actual_path" ]]; then
+            echo -e "  ${BLUE}当前 opencode 路径: $actual_path${NC}"
+        fi
+    fi
+    
+    [[ "$success" == true ]]
 }
 
 # ============================================
@@ -238,6 +462,9 @@ show_config() {
     
     # OpenCode
     local oc_auto; oc_auto=$(get_oc_autoupdate)
+    local oc_path; oc_path=$(find_package_path "$OC_PKG")
+    local oc_pm; oc_pm=$(detect_package_manager "$OC_PKG")
+    
     echo -e "${BOLD}OpenCode:${NC}"
     case "$oc_auto" in
         "true")   echo -e "  autoupdate: ${GREEN}true${NC}" ;;
@@ -245,18 +472,33 @@ show_config() {
         "notify") echo -e "  autoupdate: ${YELLOW}notify${NC}" ;;
         *)        echo -e "  autoupdate: ${BLUE}$oc_auto${NC}" ;;
     esac
+    echo -e "  包管理器: ${CYAN}$oc_pm${NC}"
+    if [[ -n "$oc_path" ]]; then
+        echo -e "  安装路径: ${CYAN}$oc_path${NC}"
+    else
+        echo -e "  安装路径: ${YELLOW}未检测到${NC}"
+    fi
     [[ -n "${OPENCODE_DISABLE_AUTOUPDATE:-}" ]] && echo -e "  ${YELLOW}⚠ OPENCODE_DISABLE_AUTOUPDATE 已设置${NC}"
     
     echo ""
     
     # Oh-My-OpenCode
     local omo_auto; omo_auto=$(get_omo_auto_update)
+    local omo_path; omo_path=$(find_package_path "$OMO_PKG")
+    local omo_pm; omo_pm=$(detect_package_manager "$OMO_PKG")
+    
     echo -e "${BOLD}Oh-My-OpenCode:${NC}"
     case "$omo_auto" in
         "true")  echo -e "  auto_update: ${GREEN}true${NC}" ;;
         "false") echo -e "  auto_update: ${RED}false${NC}" ;;
         *)       echo -e "  auto_update: ${BLUE}$omo_auto${NC}" ;;
     esac
+    echo -e "  包管理器: ${CYAN}$omo_pm${NC}"
+    if [[ -n "$omo_path" ]]; then
+        echo -e "  安装路径: ${CYAN}$omo_path${NC}"
+    else
+        echo -e "  安装路径: ${YELLOW}未检测到${NC}"
+    fi
     if is_omo_hook_disabled; then
         echo -e "  disabled_hooks: ${RED}包含 \"auto-update-checker\"${NC}"
     else
@@ -465,6 +707,12 @@ main() {
     check_deps
     local cmd="${1:-}"
     
+    # Handle version/help flags without command
+    case "$cmd" in
+        -v|--version) echo "oc-update v$VERSION"; exit 0 ;;
+        -h|--help) show_help; exit 0 ;;
+    esac
+    
     # Parse global options first
     shift || true
     while [[ $# -gt 0 ]]; do
@@ -477,7 +725,6 @@ main() {
         esac
     done
 
-    
     case "$cmd" in
         check)
             do_check
