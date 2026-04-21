@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.5"
+VERSION="1.2.6"
 
 # Flags
 CHECK_OC=true
@@ -682,9 +682,11 @@ do_check() {
             vers_to_update+=("$remote_ver")
             names_to_update+=("$OMO_NAME")
             
-            echo ""
-            echo -e "${BOLD}  更新内容:${NC}"
-            get_changelog "$OMO_REPO" | sed 's/^/    /'
+            if [[ "$local_ver" != "not-installed" ]]; then
+                echo ""
+                echo -e "${BOLD}  更新内容:${NC}"
+                get_changelog "$OMO_REPO" | sed 's/^/    /'
+            fi
         else
             echo -e "${GREEN}  ✓ 已是最新${NC}"
         fi

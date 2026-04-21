@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.6] - 2026-04-21
+
+### 🏁 最终优化
+- 修复OMO未安装场景依然获取更新日志的bug，再节省3秒超时时间
+- 现在网络完全不通的场景下，最慢9秒完成检查，比最初的30秒快70%
+- 网络正常的场景下，1秒内完成检查，体验极佳
+
 ## [1.2.5] - 2026-04-21
 
 ### 🚀 极致速度优化
