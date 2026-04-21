@@ -91,7 +91,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # Flags
 CHECK_OC=true
@@ -793,9 +793,9 @@ do_check() {
             fi
         fi
         
-        # 分状态处理更新提示
-        needs_update "$local_ver" "$remote_ver"
-        local update_status=$?
+        # 分状态处理更新提示（兼容set -e，避免非0返回导致脚本退出）
+        local update_status=0
+        needs_update "$local_ver" "$remote_ver" || update_status=$?
         if [[ $update_status -eq 0 ]]; then
             # 确定有更新
             echo -e "${YELLOW}  🆕 有更新${NC}"
@@ -849,9 +849,9 @@ do_check() {
             fi
         fi
         
-        # 分状态处理更新提示
-        needs_update "$local_ver" "$remote_ver"
-        local update_status=$?
+        # 分状态处理更新提示（兼容set -e，避免非0返回导致脚本退出）
+        local update_status=0
+        needs_update "$local_ver" "$remote_ver" || update_status=$?
         if [[ $update_status -eq 0 ]]; then
             # 确定有更新
             echo -e "${YELLOW}  🆕 有更新${NC}"
