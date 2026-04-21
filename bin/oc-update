@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.4"
+VERSION="1.2.5"
 
 # Flags
 CHECK_OC=true
@@ -344,19 +344,22 @@ get_local_version() {
 
 get_remote_version() {
     local pkg="$1"
-    # npm内置3秒超时，比系统timeout更可靠，不会残留子进程
-    local npm_timeout="--fetch-timeout=3000 --fetch-retries=0"
+    # 系统timeout，3秒超时，1秒后强制杀死，兼容所有版本npm
+    local timeout_prefix=""
+    if command -v timeout >/dev/null; then
+        timeout_prefix="timeout -k 1s 3s"
+    fi
     
     # OMO特殊处理：先尝试新包名，再尝试旧包名
     if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
         local version
-        version=$(npm $npm_timeout view "$OMO_PKG_NEW" version 2>/dev/null)
+        version=$($timeout_prefix npm view "$OMO_PKG_NEW" version 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
-        version=$(npm $npm_timeout view "$OMO_PKG_OLD" version 2>/dev/null)
+        version=$($timeout_prefix npm view "$OMO_PKG_OLD" version 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
         echo "unknown"
     else
-        npm $npm_timeout view "$1" version 2>/dev/null || echo "unknown"
+        $timeout_prefix npm view "$1" version 2>/dev/null || echo "unknown"
     fi
 }
 
@@ -646,13 +649,15 @@ do_check() {
         if needs_update "$local_ver" "$remote_ver"; then
             echo -e "${YELLOW}  🆕 有更新${NC}"
             has_update=true
-            pkgs_to_update+=("$OC_PKG")
+            pkgs_to_update+=("$pkg")
             vers_to_update+=("$remote_ver")
-            names_to_update+=("$OC_NAME")
+            names_to_update+=("$name")
             
-            echo ""
-            echo -e "${BOLD}  更新内容:${NC}"
-            get_changelog "$OC_REPO" | sed 's/^/    /'
+            if [[ "$local_ver" != "not-installed" ]]; then
+                echo ""
+                echo -e "${BOLD}  更新内容:${NC}"
+                get_changelog "$repo" | sed 's/^/    /'
+            fi
         else
             echo -e "${GREEN}  ✓ 已是最新${NC}"
         fi

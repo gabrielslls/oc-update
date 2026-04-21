@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-04-21
+
+### 🚀 极致速度优化
+- 新增未安装场景优化：首次安装时不获取更新日志，节省2次网络请求，最多快6秒
+- 优化timeout参数为`-k 1s 3s`，超时后强制杀死进程，绝对不会卡住
+
 ## [1.2.4] - 2026-04-21
 
 ### ⚡ 超时优化
