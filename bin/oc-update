@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.3"
+VERSION="1.2.4"
 
 # Flags
 CHECK_OC=true
@@ -344,20 +344,19 @@ get_local_version() {
 
 get_remote_version() {
     local pkg="$1"
-    # 优先使用timeout命令，3秒超时，兼容没有timeout的系统
-    local timeout_prefix=""
-    command -v timeout >/dev/null && timeout_prefix="timeout 3s"
+    # npm内置3秒超时，比系统timeout更可靠，不会残留子进程
+    local npm_timeout="--fetch-timeout=3000 --fetch-retries=0"
     
     # OMO特殊处理：先尝试新包名，再尝试旧包名
     if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
         local version
-        version=$($timeout_prefix npm view "$OMO_PKG_NEW" version 2>/dev/null)
+        version=$(npm $npm_timeout view "$OMO_PKG_NEW" version 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
-        version=$($timeout_prefix npm view "$OMO_PKG_OLD" version 2>/dev/null)
+        version=$(npm $npm_timeout view "$OMO_PKG_OLD" version 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
         echo "unknown"
     else
-        $timeout_prefix npm view "$1" version 2>/dev/null || echo "unknown"
+        npm $npm_timeout view "$1" version 2>/dev/null || echo "unknown"
     fi
 }
 

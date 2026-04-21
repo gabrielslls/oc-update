@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-04-21
+
+### ⚡ 超时优化
+- 改用npm内置超时参数`--fetch-timeout=3000`，比系统timeout更可靠，不会残留子进程
+- 禁用npm重试，超时直接返回，进一步减少等待时间
+
 ## [1.2.3] - 2026-04-21
 
 ### 🚀 重大性能优化
