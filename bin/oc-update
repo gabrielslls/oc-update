@@ -91,7 +91,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 # Flags
 CHECK_OC=true
@@ -871,22 +871,6 @@ do_check() {
         else
             # 无法确定（网络失败/版本无效）
             echo -e "${YELLOW}  ⚠️  无法检查更新，请稍后重试或手动执行 omo upgrade 升级${NC}"
-        fi
-        
-        if needs_update "$local_ver" "$remote_ver"; then
-            echo -e "${YELLOW}  🆕 有更新${NC}"
-            has_update=true
-            pkgs_to_update+=("$OMO_PKG")
-            vers_to_update+=("$remote_ver")
-            names_to_update+=("$OMO_NAME")
-            
-            if [[ "$local_ver" != "not-installed" ]]; then
-                echo ""
-                echo -e "${BOLD}  更新内容:${NC}"
-                get_changelog "$OMO_REPO" | sed 's/^/    /'
-            fi
-        else
-            echo -e "${GREEN}  ✓ 已是最新${NC}"
         fi
         echo ""
     fi
