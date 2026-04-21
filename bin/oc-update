@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 # Flags
 CHECK_OC=true
@@ -361,16 +361,25 @@ get_local_version() {
         fi
     fi
 
-    # 二级检测：命令不在PATH里，主动搜索常见全局安装路径（性能优先，只搜3个最常见路径）
+    # 二级检测：命令不在PATH里，主动搜索常见全局安装路径（性能优先，只搜几个最常见路径）
+    local npm_global_bin="$(npm prefix -g 2>/dev/null)/bin"
+    local nvm_current_bin=""
+    if [[ -d "$NVM_DIR/versions/node" ]]; then
+        nvm_current_bin="$(ls -d $NVM_DIR/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
+    fi
     local search_paths=(
         # 优先搜OMO
+        "$npm_global_bin/oh-my-opencode"
+        "$nvm_current_bin/oh-my-opencode"
+        "$HOME/.local/lib/node_modules/oh-my-opencode/bin/oh-my-opencode"
         "$HOME/.bun/bin/oh-my-opencode"
         "$HOME/.local/share/pnpm/oh-my-opencode"
-        "$(npm prefix -g)/bin/oh-my-opencode"
         # 再搜OpenCode
+        "$npm_global_bin/opencode"
+        "$nvm_current_bin/opencode"
+        "$HOME/.local/lib/node_modules/opencode/bin/opencode"
         "$HOME/.bun/bin/opencode"
         "$HOME/.local/share/pnpm/opencode"
-        "$(npm prefix -g)/bin/opencode"
     )
     
     for search_path in "${search_paths[@]}"; do
@@ -391,10 +400,17 @@ get_local_version() {
     done
     
     # 三级检测：搜索包目录里的package.json（更快，不遍历）
+    local npm_root="$(npm root -g 2>/dev/null)"
+    local nvm_current_root=""
+    if [[ -d "$NVM_DIR/versions/node" ]]; then
+        nvm_current_root="$(ls -d $NVM_DIR/versions/node/*/lib/node_modules 2>/dev/null | sort -V | tail -1)"
+    fi
     local pkg_paths=(
+        "$npm_root/$pkg/package.json"
+        "$nvm_current_root/$pkg/package.json"
+        "$HOME/.local/lib/node_modules/$pkg/package.json"
         "$HOME/.bun/install/global/node_modules/$pkg/package.json"
         "$HOME/.local/share/pnpm/global/5/node_modules/$pkg/package.json"
-        "$(npm root -g)/$pkg/package.json"
     )
     
     for pkg_json in "${pkg_paths[@]}"; do
