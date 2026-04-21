@@ -68,6 +68,12 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 BOLD='\033[1m'
 
+# 全局网络配置（适配国内环境）
+# npm镜像配置，默认使用淘宝源，支持环境变量覆盖
+NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
+# GitHub代理配置，默认使用ghproxy，支持环境变量覆盖
+GITHUB_PROXY="${GITHUB_PROXY:-https://ghproxy.com/}"
+
 # Package info
 OC_PKG="opencode-ai"
 # OMO包名适配：旧包名oh-my-opencode，新包名@code-yeongyu/oh-my-opencode
@@ -85,7 +91,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 # Flags
 CHECK_OC=true
@@ -435,27 +441,35 @@ get_local_version() {
 
 get_remote_version() {
     local pkg="$1"
-    # 系统timeout，3秒超时，1秒后强制杀死，兼容所有版本npm
+    # 双重超时保障：npm自带5秒超时 + 系统超时6秒强制杀死，适配国内网络
     local timeout_prefix=""
     if command -v timeout >/dev/null; then
-        timeout_prefix="timeout -k 1s 3s"
+        timeout_prefix="timeout -k 1s 6s"
     fi
+    # npm参数：5秒超时，最多重试1次，不输出多余日志
+    local npm_args="--fetch-timeout=5000 --fetch-retries=1 --no-audit --no-fund"
     
     # OMO特殊处理：先尝试新包名，再尝试旧包名
     if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
         local version
-        version=$($timeout_prefix npm view "$OMO_PKG_NEW" version 2>/dev/null)
+        version=$($timeout_prefix npm view "$OMO_PKG_NEW" version $npm_args 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
-        version=$($timeout_prefix npm view "$OMO_PKG_OLD" version 2>/dev/null)
+        version=$($timeout_prefix npm view "$OMO_PKG_OLD" version $npm_args 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
         echo "unknown"
     else
-        $timeout_prefix npm view "$1" version 2>/dev/null || echo "unknown"
+        local version
+        version=$($timeout_prefix npm view "$1" version $npm_args 2>/dev/null)
+        [[ -n "$version" ]] && echo "$version" && return
+        echo "unknown"
     fi
 }
 
 needs_update() {
     local local_ver="$1" remote_ver="$2"
+    # 远程版本获取失败时，不提示更新，避免误报
+    [[ "$remote_ver" == "unknown" ]] && return 1
+    # 本地未安装，或者版本不相等时提示更新
     [[ "$local_ver" == "not-installed" ]] || [[ "$local_ver" != "$remote_ver" ]]
 }
 
@@ -494,9 +508,9 @@ get_changelog() {
 
     # 方法 2: 使用 curl + GitHub API（无需认证）
     if command -v curl &> /dev/null; then
-        # 尝试获取最新 release，3秒超时
+        # 尝试获取最新 release，3秒连接超时，5秒总超时，使用代理加速
         local release_json
-        release_json=$(curl -s -m 3 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
+        release_json=$(curl -s --connect-timeout 3 -m 5 "${GITHUB_PROXY}https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
         if [[ -n "$release_json" ]]; then
             local body
             if command -v jq &> /dev/null; then
@@ -511,9 +525,9 @@ get_changelog() {
             fi
         fi
 
-        # 尝试获取最近 commits，3秒超时
+        # 尝试获取最近 commits，3秒连接超时，5秒总超时，使用代理加速
         local commits_json
-        commits_json=$(curl -s -m 3 "https://api.github.com/repos/$repo/commits?per_page=8" 2>/dev/null)
+        commits_json=$(curl -s --connect-timeout 3 -m 5 "${GITHUB_PROXY}https://api.github.com/repos/$repo/commits?per_page=8" 2>/dev/null)
         if [[ -n "$commits_json" ]]; then
             if command -v jq &> /dev/null; then
                 echo "$commits_json" | jq -r '.[] | "• \(.commit.message | split("\n")[0])"' 2>/dev/null
@@ -735,7 +749,13 @@ do_check() {
         local_ver=$(get_local_version "$OC_PKG")
         remote_ver=$(get_remote_version "$OC_PKG")
         
-        echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${CYAN}$remote_ver${NC}"
+        # 优化远程版本显示，获取失败时友好提示
+        if [[ "$remote_ver" == "unknown" ]]; then
+            echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${YELLOW}获取失败${NC}"
+            export REMOTE_FETCH_FAILED=1
+        else
+            echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${CYAN}$remote_ver${NC}"
+        fi
         
         # 检测是否安装但不在PATH，给出友好提示
         if [[ "$local_ver" != "not-installed" ]]; then
@@ -779,7 +799,13 @@ do_check() {
         local_ver=$(get_local_version "$OMO_PKG")
         remote_ver=$(get_remote_version "$OMO_PKG")
         
-        echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${CYAN}$remote_ver${NC}"
+        # 优化远程版本显示，获取失败时友好提示
+        if [[ "$remote_ver" == "unknown" ]]; then
+            echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${YELLOW}获取失败${NC}"
+            export REMOTE_FETCH_FAILED=1
+        else
+            echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${CYAN}$remote_ver${NC}"
+        fi
         
         if needs_update "$local_ver" "$remote_ver"; then
             echo -e "${YELLOW}  🆕 有更新${NC}"
@@ -800,6 +826,15 @@ do_check() {
     fi
     
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # 网络异常提示
+    if [[ "$REMOTE_FETCH_FAILED" == "1" ]]; then
+        echo ""
+        echo -e "${YELLOW}⚠️  网络异常，无法获取部分远程版本信息${NC}"
+        echo -e "ℹ️  国内用户可配置淘宝npm源：export NPM_REGISTRY=https://registry.npmmirror.com"
+        echo -e "ℹ️  如需自定义GitHub代理：export GITHUB_PROXY=https://your-proxy.com/"
+        echo ""
+    fi
     
     # Ask to update
     if [[ "$has_update" == true ]]; then
