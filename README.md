@@ -10,17 +10,52 @@ OpenCode 和 Oh-My-OpenCode 版本管理工具。
 - **自动更新管理**: 启用/禁用 OC/OMO 的自动更新检查
 - **多包管理器支持**: 自动检测 npm/pnpm/yarn/bun
 - **智能路径发现**: 自动定位实际运行的版本
+- **零环境配置**: 脚本内部自动注入包管理器路径，不需要修改用户全局环境变量
+- **OMO自动别名**: 安装/更新OMO后自动创建`omo`命令别名，无需手动配置
+- **增强版本检测**: 优先从命令行输出版本获取，比读package.json更准确
+- **OMO新包名适配**: 支持新包名`@code-yeongyu/oh-my-opencode`，向后兼容旧包名
 
 ## 安装
 
-通过 npm 全局安装：
+### 方法 1: npm/pnpm/yarn/bun 全局安装（推荐）
 
 ```bash
-# 从 GitHub 安装
+# npm
 npm install -g gabrielslls/oc-update
 
-# 或者本地安装
+# pnpm
+pnpm add -g gabrielslls/oc-update
+
+# yarn
+yarn global add gabrielslls/oc-update
+
+# bun
+bun add -g gabrielslls/oc-update
+
+# 本地开发安装
 npm install -g .
+```
+
+### 方法 2: 手动安装（不需要Node.js环境）
+
+直接下载脚本到用户本地bin目录：
+
+```bash
+# 下载最新版本
+curl -fsSL https://raw.githubusercontent.com/gabrielslls/oc-update/main/bin/oc-update -o ~/.local/bin/oc-update
+
+# 添加执行权限
+chmod +x ~/.local/bin/oc-update
+
+# 确保~/.local/bin在PATH中
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+### 验证安装
+
+```bash
+oc-update --version
+# 输出: oc-update v1.2.0
 ```
 
 ## 用法
@@ -82,6 +117,35 @@ oc-update config         # 显示当前配置和安装路径
   预期: 1.3.13, 实际: 1.3.7
   可能需要重新登录或运行 'hash -r' 刷新 PATH 缓存
 ```
+
+### 零配置运行
+
+脚本完全不需要修改用户全局环境变量：
+- 启动时自动检测pnpm/npm/yarn/bun的全局bin目录，临时注入到脚本内部PATH
+- 即使环境变量中没有包管理器路径，脚本也能正常找到`omo`/`opencode`命令
+- 所有修改都只在脚本运行期间生效，不影响用户其他操作
+
+### OMO自动别名创建
+
+安装/更新Oh-My-OpenCode后自动创建`omo`命令别名：
+- 自动识别当前使用的包管理器，在对应全局bin目录创建软链接
+- 同时创建`omo`和`oh-my-opencode`两个别名，指向官方原生可执行文件
+- 支持pnpm/npm/yarn/bun所有包管理器，无需用户手动配置
+
+### 增强版本检测
+
+版本检测更准确，避免"安装了最新版但检测到旧版本"的问题：
+- 优先级最高：直接从`omo --version`/`opencode --version`命令输出版本获取
+- 备选方案：从安装目录的package.json读取版本
+- OMO特殊处理：自动尝试新旧包名获取远程版本
+
+### OMO新包名适配
+
+完美适配Oh-My-OpenCode包名变更：
+- 新包名：`@code-yeongyu/oh-my-opencode`
+- 旧包名：`oh-my-opencode`
+- 自动识别新旧安装，路径检测、包管理器检测、版本获取都同时支持新旧包名
+- 平滑迁移，无需用户手动修改配置
 
 ## 配置文件
 

@@ -13,6 +13,52 @@
 
 set -e
 
+# ============================================
+# 自动添加包管理器全局bin路径到脚本内部PATH（不修改用户环境）
+# ============================================
+add_global_paths_to_path() {
+    local paths=()
+    
+    # pnpm 路径
+    if [[ -z "${PNPM_HOME:-}" ]]; then
+        PNPM_HOME="$HOME/.local/share/pnpm"
+    fi
+    [[ -d "$PNPM_HOME" ]] && paths+=("$PNPM_HOME")
+    
+    # npm 全局bin路径
+    if command -v npm &>/dev/null; then
+        local npm_bin
+        # 兼容新旧版本npm
+        npm_bin=$(npm bin -g 2>/dev/null || npm config get prefix 2>/dev/null | sed 's/$/\/bin/')
+        [[ -d "$npm_bin" ]] && paths+=("$npm_bin")
+    fi
+    
+    # yarn 全局bin路径
+    if command -v yarn &>/dev/null; then
+        local yarn_bin
+        yarn_bin=$(yarn global bin 2>/dev/null)
+        [[ -d "$yarn_bin" ]] && paths+=("$yarn_bin")
+    fi
+    
+    # bun 全局bin路径
+    [[ -d "$HOME/.bun/bin" ]] && paths+=("$HOME/.bun/bin")
+    
+    # 去重并添加到PATH开头
+    local new_path=""
+    local IFS=':'
+    for p in ${paths[*]} $PATH; do
+        if [[ ! ":$new_path:" =~ ":$p:" ]]; then
+            new_path="${new_path:+$new_path:}$p"
+        fi
+    done
+    unset IFS
+    
+    export PATH="$new_path"
+}
+
+# 执行路径添加
+add_global_paths_to_path
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,7 +70,10 @@ BOLD='\033[1m'
 
 # Package info
 OC_PKG="opencode-ai"
-OMO_PKG="oh-my-opencode"
+# OMO包名适配：旧包名oh-my-opencode，新包名@code-yeongyu/oh-my-opencode
+OMO_PKG_OLD="oh-my-opencode"
+OMO_PKG_NEW="@code-yeongyu/oh-my-opencode"
+OMO_PKG="$OMO_PKG_NEW"
 OC_NAME="OpenCode"
 OMO_NAME="Oh-My-OpenCode"
 OC_REPO="anomalyco/opencode"
@@ -36,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Flags
 CHECK_OC=true
@@ -162,23 +211,36 @@ is_omo_disabled() {
 
 # 检测包管理器类型
 detect_package_manager() {
-    # 检查是否在 pnpm 环境中
-    if command -v pnpm &>/dev/null && pnpm list -g "$1" &>/dev/null 2>&1; then
-        echo "pnpm"
-        return
-    fi
-    # 检查是否在 yarn 环境中
-    if command -v yarn &>/dev/null && yarn global list --pattern "$1" 2>/dev/null | grep -q "$1"; then
-        echo "yarn"
-        return
-    fi
-    # 检查是否在 bun 环境中
-    if command -v bun &>/dev/null && [[ -f "$HOME/.bun/install/global/node_modules/$1/package.json" ]]; then
-        echo "bun"
-        return
-    fi
-    # 默认 npm
-    echo "npm"
+    local pkg="$1"
+    # OMO特殊处理：尝试新旧包名
+    local pkgs_to_check=("$pkg")
+    [[ "$pkg" == "$OMO_PKG_NEW" ]] && pkgs_to_check+=("$OMO_PKG_OLD")
+    
+    for p in "${pkgs_to_check[@]}"; do
+        # 检查是否在 pnpm 环境中
+        if command -v pnpm &>/dev/null && pnpm list -g "$p" &>/dev/null 2>&1; then
+            echo "pnpm"
+            return
+        fi
+        # 检查是否在 yarn 环境中
+        if command -v yarn &>/dev/null && yarn global list --pattern "$p" 2>/dev/null | grep -q "$p"; then
+            echo "yarn"
+            return
+        fi
+        # 检查是否在 bun 环境中
+        if command -v bun &>/dev/null && [[ -f "$HOME/.bun/install/global/node_modules/$p/package.json" ]]; then
+            echo "bun"
+            return
+        fi
+        # 检查npm环境
+        if command -v npm &>/dev/null && npm list -g "$p" &>/dev/null 2>&1; then
+            echo "npm"
+            return
+        fi
+    done
+    
+    # 默认返回pnpm（如果安装了的话），否则npm
+    command -v pnpm &>/dev/null && echo "pnpm" || echo "npm"
 }
 
 # 查找包的实际安装路径
@@ -189,7 +251,7 @@ find_package_path() {
     # 方法 1: 通过命令路径反推（优先级最高，这是实际运行的版本）
     local cmd_name="$pkg"
     [[ "$pkg" == "opencode-ai" ]] && cmd_name="opencode"
-    [[ "$pkg" == "oh-my-opencode" ]] && cmd_name="omo"
+    [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && cmd_name="omo"
     
     local cmd_path=$(command -v "$cmd_name" 2>/dev/null)
     if [[ -n "$cmd_path" ]]; then
@@ -206,6 +268,16 @@ find_package_path() {
                 echo "$pkg_dir"
                 return
             fi
+        fi
+    fi
+    
+    # OMO特殊处理：如果没找到新包，尝试找旧包
+    if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
+        local old_path
+        old_path=$(find_package_path "$OMO_PKG_OLD")
+        if [[ -n "$old_path" ]]; then
+            echo "$old_path"
+            return
         fi
     fi
     
@@ -265,6 +337,22 @@ get_global_root() {
 
 get_local_version() {
     local pkg="$1"
+    
+    # 优先级最高：直接从运行的命令获取版本（最准确）
+    local cmd_name=""
+    [[ "$pkg" == "opencode-ai" ]] && cmd_name="opencode"
+    [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && cmd_name="omo"
+    
+    if [[ -n "$cmd_name" ]]; then
+        local cmd_version
+        cmd_version=$($cmd_name --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$cmd_version" ]]; then
+            echo "$cmd_version"
+            return
+        fi
+    fi
+    
+    # 备选方案：从package.json获取
     local pkg_path
     pkg_path=$(find_package_path "$pkg")
     
@@ -276,7 +364,18 @@ get_local_version() {
 }
 
 get_remote_version() {
-    npm view "$1" version 2>/dev/null || echo "unknown"
+    local pkg="$1"
+    # OMO特殊处理：先尝试新包名，再尝试旧包名
+    if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
+        local version
+        version=$(npm view "$OMO_PKG_NEW" version 2>/dev/null)
+        [[ -n "$version" ]] && echo "$version" && return
+        version=$(npm view "$OMO_PKG_OLD" version 2>/dev/null)
+        [[ -n "$version" ]] && echo "$version" && return
+        echo "unknown"
+    else
+        npm view "$1" version 2>/dev/null || echo "unknown"
+    fi
 }
 
 needs_update() {
@@ -445,6 +544,38 @@ update_package() {
         actual_path=$(command -v opencode 2>/dev/null)
         if [[ -n "$actual_path" ]]; then
             echo -e "  ${BLUE}当前 opencode 路径: $actual_path${NC}"
+        fi
+    fi
+    
+    # 对于Oh-My-OpenCode，自动创建omo软链接（无需用户修改环境）
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && [[ "$success" == true ]]; then
+        local omo_pkg_path
+        omo_pkg_path=$(find_package_path "$OMO_PKG")
+        if [[ -n "$omo_pkg_path" && -f "$omo_pkg_path/bin/oh-my-opencode.js" ]]; then
+            # 找到当前包管理器的全局bin目录
+            local bin_dir=""
+            case "$pm" in
+                pnpm)
+                    bin_dir="$PNPM_HOME"
+                    ;;
+                npm)
+                    bin_dir=$(npm config get prefix 2>/dev/null | sed 's/$/\/bin/')
+                    ;;
+                yarn)
+                    bin_dir=$(yarn global bin 2>/dev/null)
+                    ;;
+                bun)
+                    bin_dir="$HOME/.bun/bin"
+                    ;;
+            esac
+            
+            # 创建软链接
+            if [[ -n "$bin_dir" && -d "$bin_dir" ]]; then
+                ln -sf "$omo_pkg_path/bin/oh-my-opencode.js" "$bin_dir/oh-my-opencode"
+                ln -sf "$bin_dir/oh-my-opencode" "$bin_dir/omo"
+                chmod +x "$bin_dir/oh-my-opencode"
+                echo -e "  ${BLUE}已自动创建 omo 命令软链接到 $bin_dir${NC}"
+            fi
         fi
     fi
     
