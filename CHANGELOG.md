@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-04-21
+
+### 🚀 重大性能优化
+- **彻底解决卡顿问题**：移除不必要的文件系统遍历逻辑，不再遍历NVM/fnm的所有node版本目录，检查速度从30秒优化到1秒内
+- **修复版本显示错误**：当命令不存在时直接显示"未安装"，不会显示残留目录的错误版本
+- **代码精简**：移除冗余的路径搜索逻辑，运行更高效
+
 ## [1.2.2] - 2026-04-21
 
 ### ⚡ 性能优化

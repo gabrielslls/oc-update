@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.2"
+VERSION="1.2.3"
 
 # Flags
 CHECK_OC=true
@@ -297,17 +297,7 @@ find_package_path() {
         fi
     fi
     
-    # OMO特殊处理：如果没找到新包，尝试找旧包
-    if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
-        local old_path
-        old_path=$(find_package_path "$OMO_PKG_OLD")
-        if [[ -n "$old_path" ]]; then
-            echo "$old_path"
-            return
-        fi
-    fi
-    
-    # 方法 2: 通过 npm list 获取
+    # 方法 2: 通过 npm list 获取，不遍历文件系统避免卡顿
     if command -v npm &>/dev/null; then
         found_path=$(npm list -g "$pkg" --depth=0 --parseable 2>/dev/null | head -1)
         if [[ -n "$found_path" && -f "$found_path/package.json" ]]; then
@@ -316,37 +306,7 @@ find_package_path() {
         fi
     fi
     
-    # 方法 3: 检查常见位置（按优先级）
-    local search_paths=(
-        "$HOME/.local/lib/node_modules/$pkg"                           # 手动安装
-        "$HOME/.bun/install/global/node_modules/$pkg"                  # bun
-        "$(npm root -g 2>/dev/null)/$pkg"                              # npm 全局
-        "$HOME/.yarn/global/node_modules/$pkg"                         # yarn global
-        "/usr/local/lib/node_modules/$pkg"                             # 系统级
-        "/usr/lib/node_modules/$pkg"                                   # 系统级 (Debian)
-    )
-    
-    # NVM 路径（动态）
-    if [[ -d "$HOME/.nvm/versions/node" ]]; then
-        for nvm_dir in "$HOME/.nvm/versions/node"/*/lib/node_modules; do
-            search_paths+=("$nvm_dir/$pkg")
-        done
-    fi
-    
-    # fnm 路径
-    if [[ -d "$HOME/.fnm/node-versions" ]]; then
-        for fnm_dir in "$HOME/.fnm/node-versions"/*/installation/lib/node_modules; do
-            search_paths+=("$fnm_dir/$pkg")
-        done
-    fi
-    
-    for p in "${search_paths[@]}"; do
-        if [[ -f "$p/package.json" ]]; then
-            echo "$p"
-            return
-        fi
-    done
-    
+    # 其他路径不再遍历，避免卡顿，找不到就返回空，安装时用默认路径
     echo ""
 }
 
@@ -369,7 +329,7 @@ get_local_version() {
     [[ "$pkg" == "opencode-ai" ]] && cmd_name="opencode"
     [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && cmd_name="omo"
     
-    if [[ -n "$cmd_name" ]]; then
+    if [[ -n "$cmd_name" && -x $(command -v "$cmd_name" 2>/dev/null) ]]; then
         local cmd_version
         cmd_version=$($cmd_name --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         if [[ -n "$cmd_version" ]]; then
@@ -378,15 +338,8 @@ get_local_version() {
         fi
     fi
     
-    # 备选方案：从package.json获取
-    local pkg_path
-    pkg_path=$(find_package_path "$pkg")
-    
-    if [[ -n "$pkg_path" && -f "$pkg_path/package.json" ]]; then
-        grep '"version"' "$pkg_path/package.json" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/'
-    else
-        echo "not-installed"
-    fi
+    # 命令不存在，直接返回未安装，不遍历文件系统避免卡顿
+    echo "not-installed"
 }
 
 get_remote_version() {
