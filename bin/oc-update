@@ -76,13 +76,13 @@ GITHUB_PROXY="${GITHUB_PROXY:-https://ghproxy.com/}"
 
 # Package info
 OC_PKG="opencode-ai"
-# OMO包名适配：旧包名oh-my-opencode，新包名@code-yeongyu/oh-my-opencode
+# OMO官方npm包名从未变更，一直是oh-my-opencode，@code-yeongyu/oh-my-opencode不存在，仅作为备用
 OMO_PKG_OLD="oh-my-opencode"
 OMO_PKG_NEW="@code-yeongyu/oh-my-opencode"
-OMO_PKG="$OMO_PKG_NEW"
+OMO_PKG="$OMO_PKG_OLD"
 OC_NAME="OpenCode"
 OMO_NAME="Oh-My-OpenCode"
-OC_REPO="anomalyco/opencode"
+OC_REPO="anomaly/opencode"
 OMO_REPO="code-yeongyu/oh-my-openagent"
 
 # Config paths
@@ -91,7 +91,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.4.2"
+VERSION="1.4.4"
 
 # Flags
 CHECK_OC=true
@@ -630,13 +630,45 @@ update_package() {
             ;;
     esac
     
-    echo -e "  ${BLUE}执行: $install_cmd${NC}"
+    local install_success=false
+    local attempt_pkg="$pkg"
+    local max_attempts=1
+    # OMO双包名重试机制：自动尝试新旧两个包名，保证更新成功率
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        max_attempts=2
+    fi
     
-    if eval "$install_cmd" 2>&1; then
+    for ((attempt=0; attempt<max_attempts; attempt++)); do
+        echo -e "  ${BLUE}执行: $install_cmd${NC}"
+        if eval "$install_cmd" 2>&1; then
+            install_success=true
+            break
+        elif [[ $attempt -eq 0 && $max_attempts -eq 2 ]]; then
+            # 第一次失败，切换到备用包名重试
+            local other_pkg
+            if [[ "$attempt_pkg" == "$OMO_PKG_OLD" ]]; then
+                other_pkg="$OMO_PKG_NEW"
+            else
+                other_pkg="$OMO_PKG_OLD"
+            fi
+            echo -e "${YELLOW}  包名 $attempt_pkg 安装失败，自动尝试备用包名 $other_pkg${NC}"
+            # 替换install_cmd中的包名
+            install_cmd=${install_cmd//$attempt_pkg/$other_pkg}
+            attempt_pkg="$other_pkg"
+            pkg="$other_pkg" # 更新pkg变量用于后续校验
+        fi
+    done
+    
+    if [[ "$install_success" == true ]]; then
         # 验证更新
         sleep 1  # 等待文件系统同步
         local actual_ver
-        actual_ver=$(get_local_version "$pkg")
+        if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+            # OMO优先用omo命令直接获取版本，更准确
+            actual_ver=$(omo --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//' || get_local_version "$pkg")
+        else
+            actual_ver=$(get_local_version "$pkg")
+        fi
         
         if [[ "$actual_ver" == "$expected_ver" ]]; then
             echo -e "${GREEN}✓ $name 更新成功 (v$actual_ver)${NC}"
