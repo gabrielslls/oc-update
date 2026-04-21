@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # oc-update - Manage OpenCode and Oh-My-OpenCode updates
 #
@@ -11,7 +11,16 @@
 #   oc-update --help                 # Show help
 #
 
-set -e
+# 强制使用bash执行检测
+if [ -z "$BASH_VERSION" ]; then
+    echo "❌ 错误：此脚本必须使用bash运行，请执行：bash $0 $*" >&2
+    exit 1
+fi
+
+# 全局错误捕获
+trap 'echo -e "\n${RED}❌ 执行错误${NC}：行号 $LINENO，命令：$BASH_COMMAND，返回码：$?" >&2; exit 1' ERR
+
+set -euo pipefail
 
 # ============================================
 # 自动添加包管理器全局bin路径到脚本内部PATH（不修改用户环境）
@@ -71,14 +80,29 @@ BOLD='\033[1m'
 # 全局网络配置（适配国内环境）
 # npm镜像配置，默认使用淘宝源，支持环境变量覆盖
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
-# GitHub代理配置，默认使用ghproxy，支持环境变量覆盖
-GITHUB_PROXY="${GITHUB_PROXY:-https://ghproxy.com/}"
+# GitHub代理配置，默认使用最快的gh.llkk.cc，支持环境变量覆盖
+GITHUB_PROXY="${GITHUB_PROXY:-https://gh.llkk.cc/}"
+# 备用npm镜像源，用于fallback
+NPM_REGISTRIES=(
+    "https://registry.npmmirror.com"
+    "https://mirrors.ustc.edu.cn/npm"
+    "https://registry.npmjs.org"
+)
+
+# 系统架构检测
+ARCH="$(uname -m | tr '[:upper:]' '[:lower:]')"
+IS_AARCH64="false"
+if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+    IS_AARCH64="true"
+fi
+
+
 
 # Package info
 OC_PKG="opencode-ai"
-# OMO官方npm包名从未变更，一直是oh-my-opencode，@code-yeongyu/oh-my-opencode不存在，仅作为备用
+# OMO官方npm包名是 oh-my-opencode
 OMO_PKG_OLD="oh-my-opencode"
-OMO_PKG_NEW="@code-yeongyu/oh-my-opencode"
+OMO_PKG_NEW=""
 OMO_PKG="$OMO_PKG_OLD"
 OC_NAME="OpenCode"
 OMO_NAME="Oh-My-OpenCode"
@@ -91,24 +115,123 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.4.4"
+VERSION="1.5.0"
 
 # Flags
 CHECK_OC=true
 CHECK_OMO=true
 
+# 初始化相关变量，避免set -u未绑定错误
+OC_NOT_IN_PATH=${OC_NOT_IN_PATH:-}
+OC_PKG_FOUND=${OC_PKG_FOUND:-}
+OMO_NOT_IN_PATH=${OMO_NOT_IN_PATH:-}
+OMO_PKG_FOUND=${OMO_PKG_FOUND:-}
+REMOTE_FETCH_FAILED=${REMOTE_FETCH_FAILED:-}
+
 # ============================================
 # Utilities
 # ============================================
 
+log_debug() {
+    # 默认不输出debug信息，需要时设置DEBUG=true环境变量
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        echo -e "\033[0;34m[DEBUG]\033[0m $*" >&2
+    fi
+}
+
+# 通用GitHub资源请求函数，自动走代理重试
+get_url() {
+    local url="$1"
+    local output="${2:-}"
+    # 用户提供的代理列表，按实测速度优先级排序（2026-04-21实测）
+    local mirrors=("gh.llkk.cc|https://" "gh-proxy.com|https://" "git.yylx.win|https://" "fastgit.cc|" "ghproxy.net|https://")
+    
+    for mirror_config in "${mirrors[@]}"; do
+        local mirror="${mirror_config%%|*}"
+        local prefix="${mirror_config##*|}"
+        local req_url
+        
+        # 适配fastgit.cc特殊格式：不需要https://前缀
+        if [[ "$mirror" == "fastgit.cc" ]]; then
+            req_url="https://${mirror}/${url#https://}"
+        else
+            req_url="https://${mirror}/${prefix}${url#https://}"
+        fi
+        
+        log_debug "尝试通过代理 ${mirror} 访问: ${req_url}"
+        # 30秒超时尝试
+        if curl -s --max-time 30 --fail "$req_url" ${output:+-o "$output"}; then
+            log_debug "代理 ${mirror} 访问成功"
+            return 0
+        fi
+    done
+    
+    # 所有代理失败最后尝试直连
+    log_debug "所有代理失败，尝试直连: ${url}"
+    curl -s --max-time 30 --fail "$url" ${output:+-o "$output"} && return 0
+    
+    log_debug "所有访问方式均失败"
+    return 1
+}
+
 check_deps() {
     local missing=()
-    command -v npm &> /dev/null || missing+=("npm")
+    # 不需要强制npm，因为可以走手动安装fallback
+    # 手动安装需要curl和tar
+    command -v curl &> /dev/null || missing+=("curl")
+    command -v tar &> /dev/null || missing+=("tar")
     
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "${RED}错误: 缺少必要依赖: ${missing[*]}${NC}"
         echo "请安装上述工具后再运行 $0"
         exit 1
+    fi
+}
+
+# 带重试和超时的命令执行工具
+# 用法: run_with_retry [--retries N] [--timeout SECONDS] [--no-fail] COMMAND
+# 选项:
+#   --retries N: 最大重试次数，默认3
+#   --timeout SECONDS: 命令执行超时时间，默认20
+#   --no-fail: 即使所有重试失败也不返回错误，返回空
+run_with_retry() {
+    local retries=3
+    local timeout=20
+    local no_fail=false
+    
+    # 解析选项
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --retries) retries="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --no-fail) no_fail=true; shift ;;
+            *) break ;;
+        esac
+    done
+    
+    local cmd="$*"
+    local timeout_prefix=""
+    if command -v timeout >/dev/null; then
+        timeout_prefix="timeout -k 3s ${timeout}s"
+    fi
+    
+    for ((attempt=0; attempt<retries; attempt++)); do
+        log_debug "  命令执行尝试 $((attempt+1))/$retries：$cmd"
+        # 实时输出日志，方便用户查看进度
+        eval "$timeout_prefix $cmd" 2>&1
+        local exit_code=$?
+        if [[ $exit_code -eq 0 ]]; then
+            return 0
+        fi
+        log_debug "  尝试 $((attempt+1)) 失败，退出码：$exit_code"
+        [[ $attempt -lt $((retries-1)) ]] && sleep 1
+    done
+    
+    log_debug "  所有 $retries 次尝试均失败"
+    if [[ "$no_fail" == false ]]; then
+        return 1
+    else
+        return 0
     fi
 }
 
@@ -218,34 +341,72 @@ is_omo_disabled() {
 # 检测包管理器类型
 detect_package_manager() {
     local pkg="$1"
+    log_debug "开始检测$pkg对应的包管理器..."
+    log_debug "开始检测$pkg对应的包管理器..."
     # OMO特殊处理：尝试新旧包名
     local pkgs_to_check=("$pkg")
     [[ "$pkg" == "$OMO_PKG_NEW" ]] && pkgs_to_check+=("$OMO_PKG_OLD")
     
-    for p in "${pkgs_to_check[@]}"; do
-        # 检查是否在 pnpm 环境中（修复：不仅检查返回码，还要确认输出包含该包）
-        if command -v pnpm &>/dev/null; then
-            if pnpm list -g "$p" 2>/dev/null | grep -qE "(pnpm:|$p@)"; then
-                echo "pnpm"
-                return
-            fi
-        fi
-        # 检查是否在 yarn 环境中
-        if command -v yarn &>/dev/null && yarn global list --pattern "$p" 2>/dev/null | grep -q "$p"; then
-            echo "yarn"
-            return
-        fi
-        # 检查是否在 bun 环境中
-        if command -v bun &>/dev/null && [[ -f "$HOME/.bun/install/global/node_modules/$p/package.json" ]]; then
-            echo "bun"
-            return
-        fi
-        # 检查npm环境
+    # 验证包管理器是否可用
+    validate_pm() {
+        local pm="$1"
+        case "$pm" in
+            pnpm) command -v pnpm &>/dev/null && pnpm --version &>/dev/null ;;
+            yarn) command -v yarn &>/dev/null && yarn --version &>/dev/null ;;
+            bun) command -v bun &>/dev/null && bun --version &>/dev/null ;;
+            npm) command -v npm &>/dev/null && npm --version &>/dev/null ;;
+            *) return 1 ;;
+        esac
+        return $?
+    }
+    
+    # 检测npm版本，返回主版本号
+    get_npm_version() {
         if command -v npm &>/dev/null; then
-            if npm list -g "$p" 2>/dev/null | grep -q "$p@"; then
-                echo "npm"
-                return
+            npm --version | cut -d. -f1
+        else
+            echo 0
+        fi
+    }
+    
+    for p in "${pkgs_to_check[@]}"; do
+        # 按照优先级检查包管理器
+        for pm in "${PM_PRIORITY[@]}"; do
+            if command -v "$pm" &>/dev/null; then
+                # 检查当前包管理器是否安装了目标包
+                local found=false
+                case "$pm" in
+                    pnpm)
+                        if pnpm list -g "$p" 2>/dev/null | grep -qE "(pnpm:|$p@)"; then
+                            found=true
+                        fi
+                        ;;
+                    yarn)
+                        if yarn global list --pattern "$p" 2>/dev/null | grep -q "$p"; then
+                            found=true
+                        fi
+                        ;;
+                    npm)
+                        # aarch64下npm版本低于8.x的话，不优先使用
+                        if [[ "$IS_AARCH64" == "true" && $(get_npm_version) -lt 8 ]]; then
+                            log_debug "aarch64环境下npm版本过低（<8.x），跳过使用"
+                            continue
+                        fi
+                        if npm list -g "$p" 2>/dev/null | grep -q "$p@"; then
+                            found=true
+                        fi
+                        ;;
+                esac
+                
+                if [[ "$found" == "true" ]]; then
+                    validate_pm "$pm" && echo "$pm" && return
+                fi
             fi
+        done
+        
+        # 检查bun环境（优先级最低）
+        if command -v bun &>/dev/null && [[ -f "$HOME/.bun/install/global/node_modules/$p/package.json" ]]; then
+            validate_pm bun && echo "bun" && return
         fi
     done
     
@@ -259,60 +420,151 @@ detect_package_manager() {
         if [[ -n "$cmd_path" ]]; then
             # 解析符号链接判断来源
             if [[ "$cmd_path" == *pnpm* || "$cmd_path" == *".local/share/pnpm"* ]]; then
-                echo "pnpm"
-                return
+                command -v pnpm &>/dev/null && validate_pm pnpm && echo "pnpm" && return
             elif [[ "$cmd_path" == *bun* || "$cmd_path" == *".bun/bin"* ]]; then
-                echo "bun"
-                return
+                command -v bun &>/dev/null && validate_pm bun && echo "bun" && return
             elif [[ "$cmd_path" == *yarn* ]]; then
-                echo "yarn"
-                return
+                command -v yarn &>/dev/null && validate_pm yarn && echo "yarn" && return
             fi
         fi
     fi
     
     # 最后兜底：返回当前系统优先的包管理器
-    command -v pnpm &>/dev/null && echo "pnpm" || echo "npm"
+    if command -v pnpm &>/dev/null && validate_pm pnpm; then
+        echo "pnpm"
+    else
+        echo "npm"
+    fi
 }
 
 # 查找包的实际安装路径
 find_package_path() {
     local pkg="$1"
+    log_debug "开始查找$pkg的安装路径..."
     local found_path=""
     
     # 方法 1: 通过命令路径反推（优先级最高，这是实际运行的版本）
-    local cmd_name="$pkg"
+    local cmd_name=""
+    local full_cmd_name=""
     [[ "$pkg" == "opencode-ai" ]] && cmd_name="opencode"
-    [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && cmd_name="omo"
+    [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && cmd_name="omo" && full_cmd_name="oh-my-opencode"
     
-    local cmd_path=$(command -v "$cmd_name" 2>/dev/null)
-    if [[ -n "$cmd_path" ]]; then
-        # 解析符号链接
-        if [[ -L "$cmd_path" ]]; then
-            cmd_path=$(readlink -f "$cmd_path" 2>/dev/null || readlink "$cmd_path")
-        fi
-        # 从 bin/opencode 反推 node_modules 路径
-        if [[ "$cmd_path" == */bin/* ]]; then
-            local pkg_dir
-            pkg_dir=$(dirname "$(dirname "$cmd_path")")
-            # pkg_dir 可能是 .../node_modules/opencode-ai 或 .../node_modules/包名
-            if [[ -f "$pkg_dir/package.json" ]]; then
-                echo "$pkg_dir"
-                return
+    # 先尝试短命令
+    if [[ -n "$cmd_name" ]]; then
+        log_debug "尝试通过短命令$cmd_name查找路径..."
+        local cmd_path=$(command -v "$cmd_name" 2>/dev/null)
+        log_debug "短命令$cmd_name路径：${cmd_path:-未找到}"
+        if [[ -n "$cmd_path" ]]; then
+            # 如果是符号链接，解析到真实路径
+            if [[ -L "$cmd_path" ]]; then
+                log_debug "解析符号链接..."
+                cmd_path=$(readlink -f "$cmd_path" 2>/dev/null || readlink "$cmd_path")
+            fi
+            # 从 bin/opencode 反推 node_modules 路径
+            if [[ "$cmd_path" == */bin/* ]]; then
+                local pkg_dir
+                pkg_dir=$(dirname "$(dirname "$cmd_path")")
+                # pkg_dir 可能是 .../node_modules/opencode-ai 或 .../node_modules/包名
+                if [[ -f "$pkg_dir/package.json" ]]; then
+                    log_debug "通过命令路径找到安装路径：$pkg_dir"
+                    echo "$pkg_dir"
+                    return 0
+                fi
             fi
         fi
     fi
     
-    # 方法 2: 通过 npm list 获取，不遍历文件系统避免卡顿
-    if command -v npm &>/dev/null; then
-        found_path=$(npm list -g "$pkg" --depth=0 --parseable 2>/dev/null | head -1)
-        if [[ -n "$found_path" && -f "$found_path/package.json" ]]; then
-            echo "$found_path"
-            return
+    # 尝试全命令名
+    if [[ -n "$full_cmd_name" ]]; then
+        log_debug "尝试通过全命令名$full_cmd_name查找路径..."
+        local full_cmd_path=$(command -v "$full_cmd_name" 2>/dev/null)
+        log_debug "全命令名$full_cmd_name路径：${full_cmd_path:-未找到}"
+        if [[ -n "$full_cmd_path" ]]; then
+            if [[ -L "$full_cmd_path" ]]; then
+                log_debug "解析符号链接..."
+                full_cmd_path=$(readlink -f "$full_cmd_path" 2>/dev/null || readlink "$full_cmd_path")
+            fi
+            if [[ "$full_cmd_path" == */bin/* ]]; then
+                local pkg_dir
+                pkg_dir=$(dirname "$(dirname "$full_cmd_path")")
+                if [[ -f "$pkg_dir/package.json" ]]; then
+                    log_debug "通过全命令名路径找到安装路径：$pkg_dir"
+                    echo "$pkg_dir"
+                    return 0
+                fi
+            fi
         fi
     fi
-    
-    # 其他路径不再遍历，避免卡顿，找不到就返回空，安装时用默认路径
+
+    # 方法 2: 通过包管理器 list 命令查找
+    log_debug "尝试通过包管理器命令查找安装路径..."
+    # 检查npm
+    if command -v npm &>/dev/null; then
+        local npm_path=$(npm list -g "$pkg" --parseable 2>/dev/null | head -1)
+        if [[ -n "$npm_path" && -f "$npm_path/package.json" ]]; then
+            log_debug "通过npm找到安装路径：$npm_path"
+            echo "$npm_path"
+            return 0
+        fi
+    fi
+
+    # 检查pnpm
+    if command -v pnpm &>/dev/null; then
+        local pnpm_path=$(pnpm list -g "$pkg" --parseable 2>/dev/null | head -1)
+        if [[ -n "$pnpm_path" && -f "$pnpm_path/package.json" ]]; then
+            log_debug "通过pnpm找到安装路径：$pnpm_path"
+            echo "$pnpm_path"
+            return 0
+        fi
+    fi
+
+    # 检查yarn
+    if command -v yarn &>/dev/null; then
+        local yarn_path=$(yarn global list --pattern "$pkg" --parseable 2>/dev/null | head -1)
+        if [[ -n "$yarn_path" && -f "$yarn_path/package.json" ]]; then
+            log_debug "通过yarn找到安装路径：$yarn_path"
+            echo "$yarn_path"
+            return 0
+        fi
+    fi
+
+    # 方法 3: 搜索常见全局安装目录
+    log_debug "尝试搜索常见安装目录..."
+    local search_dirs=(
+        "$HOME/.local/lib/node_modules/$pkg"
+        "$HOME/.nvm/versions/node/*/lib/node_modules/$pkg"
+        "$HOME/.fnm/node-versions/*/lib/node_modules/$pkg"
+        "$HOME/.bun/install/global/node_modules/$pkg"
+        "$HOME/.local/share/pnpm/global/*/node_modules/$pkg"
+        "/usr/local/lib/node_modules/$pkg"
+        "/usr/lib/node_modules/$pkg"
+    )
+
+    for dir_pattern in "${search_dirs[@]}"; do
+        # 使用通配符匹配多个版本
+        local matching_dirs=()
+        # 临时启用nullglob处理空匹配
+        local old_nullglob=$(shopt -p nullglob || true)
+        shopt -s nullglob
+        matching_dirs=($dir_pattern)
+        # 恢复原来的设置
+        eval "$old_nullglob" 2>/dev/null || true
+        for dir in "${matching_dirs[@]}"; do
+            if [[ -d "$dir" && -f "$dir/package.json" ]]; then
+                log_debug "通过目录搜索找到安装路径：$dir"
+                echo "$dir"
+                return 0
+            fi
+        done
+    done
+
+    # 所有方法都没找到
+    log_debug "未找到$pkg的安装路径"
+    echo ""
+    return 1
+}
+
+main() {
     echo ""
 }
 
@@ -370,19 +622,28 @@ get_local_version() {
     # 二级检测：命令不在PATH里，主动搜索常见全局安装路径（性能优先，只搜几个最常见路径）
     local npm_global_bin="$(npm prefix -g 2>/dev/null)/bin"
     local nvm_current_bin=""
+    local fnm_current_bin=""
     if [[ -d "$NVM_DIR/versions/node" ]]; then
         nvm_current_bin="$(ls -d $NVM_DIR/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
+    fi
+    # fnm 支持
+    if command -v fnm &>/dev/null; then
+        fnm_current_bin="$(fnm current 2>/dev/null)/bin"
+    elif [[ -d "$HOME/.fnm" ]]; then
+        fnm_current_bin="$HOME/.fnm/node-versions/$(ls -t $HOME/.fnm/node-versions/ 2>/dev/null | head -1)/bin"
     fi
     local search_paths=(
         # 优先搜OMO
         "$npm_global_bin/oh-my-opencode"
         "$nvm_current_bin/oh-my-opencode"
+        "$fnm_current_bin/oh-my-opencode"
         "$HOME/.local/lib/node_modules/oh-my-opencode/bin/oh-my-opencode"
         "$HOME/.bun/bin/oh-my-opencode"
         "$HOME/.local/share/pnpm/oh-my-opencode"
         # 再搜OpenCode
         "$npm_global_bin/opencode"
         "$nvm_current_bin/opencode"
+        "$fnm_current_bin/opencode"
         "$HOME/.local/lib/node_modules/opencode/bin/opencode"
         "$HOME/.bun/bin/opencode"
         "$HOME/.local/share/pnpm/opencode"
@@ -408,12 +669,20 @@ get_local_version() {
     # 三级检测：搜索包目录里的package.json（更快，不遍历）
     local npm_root="$(npm root -g 2>/dev/null)"
     local nvm_current_root=""
+    local fnm_current_root=""
     if [[ -d "$NVM_DIR/versions/node" ]]; then
         nvm_current_root="$(ls -d $NVM_DIR/versions/node/*/lib/node_modules 2>/dev/null | sort -V | tail -1)"
+    fi
+    # fnm 支持
+    if command -v fnm &>/dev/null; then
+        fnm_current_root="$(fnm current 2>/dev/null)/lib/node_modules"
+    elif [[ -d "$HOME/.fnm/node-versions" ]]; then
+        fnm_current_root="$HOME/.fnm/node-versions/$(ls -t $HOME/.fnm/node-versions/ 2>/dev/null | head -1)/lib/node_modules"
     fi
     local pkg_paths=(
         "$npm_root/$pkg/package.json"
         "$nvm_current_root/$pkg/package.json"
+        "$fnm_current_root/$pkg/package.json"
         "$HOME/.local/lib/node_modules/$pkg/package.json"
         "$HOME/.bun/install/global/node_modules/$pkg/package.json"
         "$HOME/.local/share/pnpm/global/5/node_modules/$pkg/package.json"
@@ -441,28 +710,72 @@ get_local_version() {
 
 get_remote_version() {
     local pkg="$1"
-    # 优先使用timeout命令，3秒超时，1秒后强制杀死，兼容所有版本npm
-    local timeout_prefix=""
-    if command -v timeout >/dev/null; then
-        timeout_prefix="timeout -k 1s 6s"
-    fi
-    # npm参数：5秒超时，不重试，不输出多余日志
-    local npm_args="--fetch-timeout=5000 --fetch-retries=0 --no-audit --no-fund $([ -n "$NPM_REGISTRY" ] && echo "--registry=$NPM_REGISTRY")"
     
-    # OMO特殊处理：先尝试新包名，再尝试旧包名
-    if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
-        local version
-        version=$($timeout_prefix npm view "$OMO_PKG_NEW" version $npm_args 2>/dev/null)
-        [[ -n "$version" ]] && echo "$version" && return
-        version=$($timeout_prefix npm view "$OMO_PKG_OLD" version $npm_args 2>/dev/null)
-        [[ -n "$version" ]] && echo "$version" && return
-        echo "unknown"
-    else
-        local version
-        version=$($timeout_prefix npm view "$1" version $npm_args 2>/dev/null)
-        [[ -n "$version" ]] && echo "$version" && return
-        echo "unknown"
+    # 第一步：优先用国内npmmirror公开API获取版本，不需要本地npm，速度快
+    log_debug "尝试通过npmmirror获取$pkg最新版本..."
+    local version=""
+    version=$(curl -s --max-time 10 "https://registry.npmmirror.com/${pkg}/latest" | head -n 20 | grep -E '"version"[[:space:]]*:' | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | sed 's/^v//' | head -n 1)
+    if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_debug "npmmirror获取版本成功：v$version"
+        echo "$version"
+        return 0
     fi
+    
+    # 第二步：如果是OMO，尝试新旧两个包名
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        local other_pkg=$([ "$pkg" == "$OMO_PKG_OLD" ] && echo "$OMO_PKG_NEW" || echo "$OMO_PKG_OLD")
+        log_debug "尝试OMO备用包名$other_pkg..."
+        version=$(curl -s --max-time 10 "https://registry.npmmirror.com/${other_pkg}/latest" | head -n 20 | grep -E '"version"[[:space:]]*:' | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | sed 's/^v//' | head -n 1)
+        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_debug "npmmirror获取OMO备用包名版本成功：v$version"
+            echo "$version"
+            return 0
+        fi
+    fi
+    
+    # 第三步：fallback到GitHub的VERSION文件，走代理
+    log_debug "npmmirror获取失败，尝试通过GitHub获取版本..."
+    local repo=""
+    [[ "$pkg" == "opencode-ai" ]] && repo="$OC_REPO"
+    [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && repo="$OMO_REPO"
+    if [[ -n "$repo" ]]; then
+        # 使用get_url函数自动走代理
+        version=$(get_url "https://raw.githubusercontent.com/${repo}/main/VERSION" | head -n 1 | tr -d '[:space:]' | sed 's/^v//')
+        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_debug "GitHub获取版本成功：v$version"
+            echo "$version"
+            return 0
+        fi
+    fi
+    
+    # 第四步：如果本地有npm，尝试用npm view命令获取
+    if command -v npm &>/dev/null; then
+        log_debug "尝试通过npm获取版本..."
+        # npm参数：15秒超时，不输出多余日志
+        local npm_args="--fetch-timeout=15000 --no-audit --no-fund $([ -n "$NPM_REGISTRY" ] && echo "--registry=$NPM_REGISTRY")"
+        version=$(run_with_retry --retries 2 --timeout 20 npm view "$pkg" version $npm_args 2>/dev/null)
+        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_debug "npm获取版本成功：v$version"
+            echo "$version"
+            return 0
+        fi
+        
+        # OMO特殊处理：尝试另一个包名
+        if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+            local other_pkg=$([ "$pkg" == "$OMO_PKG_OLD" ] && echo "$OMO_PKG_NEW" || echo "$OMO_PKG_OLD")
+            version=$(run_with_retry --retries 2 --timeout 20 npm view "$other_pkg" version $npm_args 2>/dev/null)
+            if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                log_debug "npm获取OMO备用包名版本成功：v$version"
+                echo "$version"
+                return 0
+            fi
+        fi
+    fi
+    
+    # 所有方法都失败
+    log_debug "所有版本获取方式都失败"
+    echo "unknown"
+    return 1
 }
 
 # 带重试获取远程版本
@@ -531,42 +844,63 @@ get_changelog() {
 
     # 方法 2: 使用 curl + GitHub API（无需认证）
     if command -v curl &> /dev/null; then
-        # 尝试获取最新 release，3秒连接超时，5秒总超时，使用代理加速
-        local release_json
-        release_json=$(curl -s --connect-timeout 3 -m 5 "${GITHUB_PROXY}https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
-        if [[ -n "$release_json" ]]; then
-            local body
-            if command -v jq &> /dev/null; then
-                body=$(echo "$release_json" | jq -r '.body // empty' 2>/dev/null)
-            else
-                body=$(echo "$release_json" | grep -o '"body"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"body"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//' | head -1)
-            fi
-            if [[ -n "$body" && "$body" != "null" ]]; then
-                echo "$body" | head -20
-                $set_e_state && set -e
-                return
-            fi
-        fi
+        # 优先尝试直接访问 GitHub API（不使用代理），失败再使用代理
+        local api_urls=(
+            "https://api.github.com/repos/$repo/releases/latest"
+            "${GITHUB_PROXY}https://api.github.com/repos/$repo/releases/latest"
+        )
 
-        # 尝试获取最近 commits，3秒连接超时，5秒总超时，使用代理加速
-        local commits_json
-        commits_json=$(curl -s --connect-timeout 3 -m 5 "${GITHUB_PROXY}https://api.github.com/repos/$repo/commits?per_page=8" 2>/dev/null)
-        if [[ -n "$commits_json" ]]; then
-            if command -v jq &> /dev/null; then
-                echo "$commits_json" | jq -r '.[] | "• \(.commit.message | split("\n")[0])"' 2>/dev/null
-                if [[ $? -eq 0 ]]; then
+        for api_url in "${api_urls[@]}"; do
+            log_debug "尝试获取 changelog: $api_url"
+            local release_json
+            release_json=$(curl -s --connect-timeout 5 -m 10 "$api_url" 2>/dev/null)
+
+            # 检查是否返回有效JSON（不是错误消息）
+            if [[ -n "$release_json" && "$release_json" != "{"*'"message"'* && "$release_json" != "Not Found"* ]]; then
+                local body
+                if command -v jq &> /dev/null; then
+                    body=$(echo "$release_json" | jq -r '.body // empty' 2>/dev/null)
+                else
+                    body=$(echo "$release_json" | grep -o '"body"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"body"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//' | head -1)
+                fi
+                if [[ -n "$body" && "$body" != "null" ]]; then
+                    echo "$body" | head -20
                     $set_e_state && set -e
                     return
                 fi
-            else
-                # 简单解析 commit messages
-                echo "$commits_json" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"message"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//' | head -8 | while read -r line; do
-                    echo "• $line"
-                done
-                $set_e_state && set -e
-                return
             fi
-        fi
+        done
+
+        # 如果 release 失败，尝试获取最近 commits
+        local commits_urls=(
+            "https://api.github.com/repos/$repo/commits?per_page=8"
+            "${GITHUB_PROXY}https://api.github.com/repos/$repo/commits?per_page=8"
+        )
+
+        for commits_url in "${commits_urls[@]}"; do
+            log_debug "尝试获取 commits: $commits_url"
+            local commits_json
+            commits_json=$(curl -s --connect-timeout 5 -m 10 "$commits_url" 2>/dev/null)
+
+            if [[ -n "$commits_json" && "$commits_json" != "{"*'"message"'* && "$commits_json" != "Not Found"* ]]; then
+                if command -v jq &> /dev/null; then
+                    local commits_output
+                    commits_output=$(echo "$commits_json" | jq -r '.[] | "• \(.commit.message | split("\n")[0])"' 2>/dev/null)
+                    if [[ -n "$commits_output" ]]; then
+                        echo "$commits_output"
+                        $set_e_state && set -e
+                        return
+                    fi
+                else
+                    # 简单解析 commit messages
+                    echo "$commits_json" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"message"[[:space:]]*:[[:space:]]*//; s/^"//; s/"$//' | head -8 | while read -r line; do
+                        echo "• $line"
+                    done
+                    $set_e_state && set -e
+                    return
+                fi
+            fi
+        done
     fi
 
     # 恢复 set -e 状态
@@ -577,6 +911,43 @@ get_changelog() {
 update_package() {
     local pkg="$1" name="$2" expected_ver="$3"
     echo -e "${CYAN}正在更新 $name 到 $expected_ver...${NC}"
+    
+    # 尝试加载nvm环境（解决非交互式shell下nvm不自动加载的问题）
+    load_nvm() {
+        # 常见的nvm安装路径
+        local nvm_paths=(
+            "$HOME/.nvm/nvm.sh"
+            "$HOME/.config/nvm/nvm.sh"
+            "/usr/local/nvm/nvm.sh"
+            "/opt/nvm/nvm.sh"
+        )
+        
+        for nvm_path in "${nvm_paths[@]}"; do
+            if [[ -f "$nvm_path" ]]; then
+                log_debug "加载nvm环境：$nvm_path"
+                # 加载nvm，静默输出
+                source "$nvm_path" >/dev/null 2>&1 || true
+                # 加载nvm bash_completion（可选）
+                [[ -f "${nvm_path%/*}/bash_completion" ]] && source "${nvm_path%/*}/bash_completion" >/dev/null 2>&1 || true
+                
+                # 尝试使用默认node版本
+                if command -v nvm &>/dev/null; then
+                    log_debug "使用nvm加载默认Node版本"
+                    nvm use default >/dev/null 2>&1 || nvm use stable >/dev/null 2>&1 || true
+                fi
+                
+                # 验证是否成功加载到npm
+                if command -v npm &>/dev/null; then
+                    log_debug "nvm加载成功，npm版本：$(npm --version 2>/dev/null || echo '未知')"
+                    return 0
+                fi
+            fi
+        done
+        log_debug "未找到nvm环境或加载失败"
+        return 1
+    }
+    # 先尝试加载nvm环境
+    load_nvm
     
     # 检测包管理器
     local pm
@@ -1050,6 +1421,16 @@ EOF
 
 main() {
     check_deps
+    
+    # 输出关键环境信息（DEBUG模式下）
+    log_debug "=== 环境信息 ==="
+    log_debug "系统架构: $ARCH"
+    log_debug "是否aarch64: $IS_AARCH64"
+    log_debug "当前shell: $SHELL"
+    log_debug "npm默认镜像: $NPM_REGISTRY"
+    log_debug "GitHub代理: $GITHUB_PROXY"
+    log_debug "================"
+    
     local cmd="${1:-}"
     
     # Handle version/help flags without command

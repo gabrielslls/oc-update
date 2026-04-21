@@ -8,32 +8,25 @@ OpenCode 和 Oh-My-OpenCode 版本管理工具。
 - **交互式更新**: 检查后询问是否更新
 - **直接更新**: 跳过询问直接更新
 - **自动更新管理**: 启用/禁用 OC/OMO 的自动更新检查
-- **多包管理器支持**: 自动检测 npm/pnpm/yarn/bun
+- **多包管理器支持**: 自动检测 npm/pnpm/yarn/bun/fnm
 - **智能路径发现**: 自动定位实际运行的版本
 - **零环境配置**: 脚本内部自动注入包管理器路径，不需要修改用户全局环境变量
 - **OMO自动别名**: 安装/更新OMO后自动创建`omo`命令别名，无需手动配置
 - **增强版本检测**: 优先从命令行输出版本获取，比读package.json更准确
-- **OMO新包名适配**: 支持新包名`@code-yeongyu/oh-my-opencode`，向后兼容旧包名
+- **GitHub代理加速**: 内置多代理自动选择最优节点
 
 ## 安装
 
-### 方法 1: npm/pnpm/yarn/bun 全局安装（推荐）
+### 方法 1: 本地开发安装（推荐）
 
 ```bash
-# npm
-npm install -g gabrielslls/oc-update
-
-# pnpm
-pnpm add -g gabrielslls/oc-update
-
-# yarn
-yarn global add gabrielslls/oc-update
-
-# bun
-bun add -g gabrielslls/oc-update
-
-# 本地开发安装
+# 克隆仓库后本地安装
 npm install -g .
+
+# 或使用其他包管理器
+pnpm add -g .
+yarn global add .
+bun add -g .
 ```
 
 ### 方法 2: 手动安装（不需要Node.js环境）
@@ -42,7 +35,7 @@ npm install -g .
 
 ```bash
 # 下载最新版本
-curl -fsSL https://raw.githubusercontent.com/gabrielslls/oc-update/main/bin/oc-update -o ~/.local/bin/oc-update
+curl -fsSL https://raw.githubusercontent.com/sunlei/oc-update/main/bin/oc-update -o ~/.local/bin/oc-update
 
 # 添加执行权限
 chmod +x ~/.local/bin/oc-update
@@ -55,7 +48,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 
 ```bash
 oc-update --version
-# 输出: oc-update v1.2.0
+# 输出: oc-update v1.5.0
 ```
 
 ## 用法
@@ -91,6 +84,7 @@ oc-update config         # 显示当前配置和安装路径
 | pnpm | `pnpm list -g` 成功 |
 | yarn | `yarn global list` 包含目标包 |
 | bun | `~/.bun/install/global` 存在 |
+| fnm | fnm 环境支持 |
 
 ### 智能路径发现
 
@@ -104,8 +98,9 @@ oc-update config         # 显示当前配置和安装路径
 
 - `~/.local/lib/node_modules` (手动安装)
 - `~/.nvm/versions/node/*/lib/node_modules` (NVM)
-- `~/.fnm/node-versions/*/installation/lib/node_modules` (fnm)
+- `~/.fnm/node-versions/*/lib/node_modules` (fnm)
 - `~/.bun/install/global/node_modules` (bun)
+- `~/.local/share/pnpm/global/*/node_modules` (pnpm)
 - `/usr/local/lib/node_modules` (系统级)
 - `/usr/lib/node_modules` (Debian 系统级)
 
@@ -139,13 +134,12 @@ oc-update config         # 显示当前配置和安装路径
 - 备选方案：从安装目录的package.json读取版本
 - OMO特殊处理：自动尝试新旧包名获取远程版本
 
-### OMO新包名适配
+### OMO包名适配
 
-完美适配Oh-My-OpenCode包名变更：
-- 新包名：`@code-yeongyu/oh-my-opencode`
-- 旧包名：`oh-my-opencode`
-- 自动识别新旧安装，路径检测、包管理器检测、版本获取都同时支持新旧包名
-- 平滑迁移，无需用户手动修改配置
+Oh-My-OpenCode 在 npm 上的包名为 `oh-my-opencode`：
+- 包名：`oh-my-opencode`
+- 自动识别安装路径、包管理器检测、版本获取
+- 支持平滑迁移，无需用户手动修改配置
 
 ## 配置文件
 
@@ -171,6 +165,23 @@ oc-update config         # 显示当前配置和安装路径
 - `disabled_hooks: ["auto-update-checker"]` 禁用更新检查 hook
 
 详见 [docs/opencode-autoupdate.md](docs/opencode-autoupdate.md)
+
+## GitHub 代理配置
+
+脚本内置 GitHub 代理加速，自动选择最优节点：
+
+| 优先级 | 镜像 | 实测延迟 |
+|--------|------|----------|
+| 1 | gh.llkk.cc | ~560ms ⭐ |
+| 2 | gh-proxy.com | ~1010ms |
+| 3 | git.yylx.win | ~1040ms |
+| 4 | fastgit.cc | ~1090ms |
+| 5 | ghproxy.net | ~2200ms |
+
+**自定义代理**（可选）：
+```bash
+export GITHUB_PROXY=https://your-proxy.com/
+```
 
 ## 依赖
 
