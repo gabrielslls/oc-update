@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # Flags
 CHECK_OC=true
@@ -217,10 +217,12 @@ detect_package_manager() {
     [[ "$pkg" == "$OMO_PKG_NEW" ]] && pkgs_to_check+=("$OMO_PKG_OLD")
     
     for p in "${pkgs_to_check[@]}"; do
-        # 检查是否在 pnpm 环境中
-        if command -v pnpm &>/dev/null && pnpm list -g "$p" &>/dev/null 2>&1; then
-            echo "pnpm"
-            return
+        # 检查是否在 pnpm 环境中（修复：不仅检查返回码，还要确认输出包含该包）
+        if command -v pnpm &>/dev/null; then
+            if pnpm list -g "$p" 2>/dev/null | grep -qE "(pnpm:|$p@)"; then
+                echo "pnpm"
+                return
+            fi
         fi
         # 检查是否在 yarn 环境中
         if command -v yarn &>/dev/null && yarn global list --pattern "$p" 2>/dev/null | grep -q "$p"; then
@@ -233,13 +235,37 @@ detect_package_manager() {
             return
         fi
         # 检查npm环境
-        if command -v npm &>/dev/null && npm list -g "$p" &>/dev/null 2>&1; then
-            echo "npm"
-            return
+        if command -v npm &>/dev/null; then
+            if npm list -g "$p" 2>/dev/null | grep -q "$p@"; then
+                echo "npm"
+                return
+            fi
         fi
     done
     
-    # 默认返回pnpm（如果安装了的话），否则npm
+    # 如果都没检测到，优先检测当前实际运行命令的安装来源
+    local cmd_name=""
+    [[ "$pkg" == "opencode-ai" ]] && cmd_name="opencode"
+    [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && cmd_name="omo"
+    
+    if [[ -n "$cmd_name" ]]; then
+        local cmd_path=$(command -v "$cmd_name" 2>/dev/null)
+        if [[ -n "$cmd_path" ]]; then
+            # 解析符号链接判断来源
+            if [[ "$cmd_path" == *pnpm* || "$cmd_path" == *".local/share/pnpm"* ]]; then
+                echo "pnpm"
+                return
+            elif [[ "$cmd_path" == *bun* || "$cmd_path" == *".bun/bin"* ]]; then
+                echo "bun"
+                return
+            elif [[ "$cmd_path" == *yarn* ]]; then
+                echo "yarn"
+                return
+            fi
+        fi
+    fi
+    
+    # 最后兜底：返回当前系统优先的包管理器
     command -v pnpm &>/dev/null && echo "pnpm" || echo "npm"
 }
 

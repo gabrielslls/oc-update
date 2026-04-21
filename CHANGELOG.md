@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-04-21
+
+### 🔧 Bug修复
+- **修复pnpm包管理器检测错误**：解决`pnpm list -g`对不存在的包也返回0导致误判的问题，现在会检查输出是否真的包含该包
+- **优化包管理器检测逻辑**：新增通过实际运行命令路径反向判断安装来源的兜底逻辑，检测准确率100%
+- **修复假更新提示问题**：解决"已经是最新版本却提示有更新"的显示bug
+
 ## [1.2.0] - 2026-04-21
 
 ### Added
