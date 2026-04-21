@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 # Flags
 CHECK_OC=true
@@ -391,16 +391,20 @@ get_local_version() {
 
 get_remote_version() {
     local pkg="$1"
+    # 优先使用timeout命令，3秒超时，兼容没有timeout的系统
+    local timeout_prefix=""
+    command -v timeout >/dev/null && timeout_prefix="timeout 3s"
+    
     # OMO特殊处理：先尝试新包名，再尝试旧包名
     if [[ "$pkg" == "$OMO_PKG_NEW" ]]; then
         local version
-        version=$(npm view "$OMO_PKG_NEW" version 2>/dev/null)
+        version=$($timeout_prefix npm view "$OMO_PKG_NEW" version 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
-        version=$(npm view "$OMO_PKG_OLD" version 2>/dev/null)
+        version=$($timeout_prefix npm view "$OMO_PKG_OLD" version 2>/dev/null)
         [[ -n "$version" ]] && echo "$version" && return
         echo "unknown"
     else
-        npm view "$1" version 2>/dev/null || echo "unknown"
+        $timeout_prefix npm view "$1" version 2>/dev/null || echo "unknown"
     fi
 }
 
@@ -444,9 +448,9 @@ get_changelog() {
 
     # 方法 2: 使用 curl + GitHub API（无需认证）
     if command -v curl &> /dev/null; then
-        # 尝试获取最新 release
+        # 尝试获取最新 release，3秒超时
         local release_json
-        release_json=$(curl -s "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
+        release_json=$(curl -s -m 3 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
         if [[ -n "$release_json" ]]; then
             local body
             if command -v jq &> /dev/null; then
@@ -461,9 +465,9 @@ get_changelog() {
             fi
         fi
 
-        # 尝试获取最近 commits
+        # 尝试获取最近 commits，3秒超时
         local commits_json
-        commits_json=$(curl -s "https://api.github.com/repos/$repo/commits?per_page=8" 2>/dev/null)
+        commits_json=$(curl -s -m 3 "https://api.github.com/repos/$repo/commits?per_page=8" 2>/dev/null)
         if [[ -n "$commits_json" ]]; then
             if command -v jq &> /dev/null; then
                 echo "$commits_json" | jq -r '.[] | "• \(.commit.message | split("\n")[0])"' 2>/dev/null

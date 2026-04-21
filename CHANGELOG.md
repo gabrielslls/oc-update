@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-04-21
+
+### ⚡ 性能优化
+- **彻底解决检查卡顿问题**：给所有网络请求添加3秒超时，网络差时失败立刻跳过，不会长时间卡住
+  - `npm view`查询加3秒超时
+  - GitHub API curl请求加3秒超时
+  - 兼容无`timeout`命令的系统，自动降级不报错
+- **优化更新日志获取逻辑**：网络失败立刻显示"获取失败"，不浪费时间重试
+
 ## [1.2.1] - 2026-04-21
 
 ### 🔧 Bug修复
