@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.6"
+VERSION="1.2.7"
 
 # Flags
 CHECK_OC=true
@@ -329,16 +329,26 @@ get_local_version() {
     [[ "$pkg" == "opencode-ai" ]] && cmd_name="opencode"
     [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && cmd_name="omo"
     
-    if [[ -n "$cmd_name" && -x $(command -v "$cmd_name" 2>/dev/null) ]]; then
-        local cmd_version
-        cmd_version=$($cmd_name --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        if [[ -n "$cmd_version" ]]; then
-            echo "$cmd_version"
-            return
+    if [[ -n "$cmd_name" ]]; then
+        local cmd_path=$(command -v "$cmd_name" 2>/dev/null)
+        if [[ -x "$cmd_path" ]]; then
+            local cmd_version
+            # 合并stderr和stdout，支持版本输出到stderr的情况，支持带v前缀的版本号
+            cmd_version=$($cmd_name --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//')
+            if [[ -n "$cmd_version" ]]; then
+                echo "$cmd_version"
+                return
+            fi
+            # 尝试用-v参数获取版本
+            cmd_version=$($cmd_name -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//')
+            if [[ -n "$cmd_version" ]]; then
+                echo "$cmd_version"
+                return
+            fi
         fi
     fi
     
-    # 命令不存在，直接返回未安装，不遍历文件系统避免卡顿
+    # 命令不存在或获取版本失败，返回未安装
     echo "not-installed"
 }
 

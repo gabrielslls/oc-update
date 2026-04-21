@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.7] - 2026-04-21
+
+### 🐛 修复检测bug
+- **解决OMO已安装但显示未安装的问题**：
+  1. 合并stderr和stdout捕获版本号，解决部分CLI将版本输出到stderr导致获取不到的问题
+  2. 支持带v前缀的版本号格式（比如v3.17.4）
+  3. 新增尝试`-v`参数获取版本，兼容不同CLI规范
+  4. 优化路径判断严谨性，避免路径包含空格时出错
+
 ## [1.2.6] - 2026-04-21
 
 ### 🏁 最终优化
