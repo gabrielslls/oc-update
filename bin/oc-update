@@ -85,7 +85,7 @@ OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 
 # Version
-VERSION="1.2.7"
+VERSION="1.2.8"
 
 # Flags
 CHECK_OC=true
@@ -813,6 +813,8 @@ Commands:
   disable [oc|omo|all]   禁用自动更新检查
   enable [oc|omo|all]    启用自动更新检查
   config                 显示当前配置
+  version                显示当前oc-update版本号
+  help                   显示帮助信息
 
 Options:
   --oc          仅操作 OpenCode
@@ -839,8 +841,8 @@ main() {
     
     # Handle version/help flags without command
     case "$cmd" in
-        -v|--version) echo "oc-update v$VERSION"; exit 0 ;;
-        -h|--help) show_help; exit 0 ;;
+        -v|--version|version) echo "oc-update v$VERSION"; exit 0 ;;
+        -h|--help|help) show_help; exit 0 ;;
     esac
     
     # Parse global options first
