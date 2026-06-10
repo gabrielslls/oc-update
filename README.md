@@ -243,6 +243,48 @@ Oh-My-OpenCode:
   disabled_hooks: 包含 "auto-update-checker"
 ```
 
+## 故障诊断
+
+`oc-update config` 已内置缓存健康检查，运行即可检测常见问题：
+
+### 缓存版本不一致
+
+OpenCode 从 `~/.cache/opencode/node_modules/` 加载 OMO 插件，而非全局安装位置。
+如果全局更新后 OpenCode 仍使用旧版本：
+
+```bash
+# 1. 在缓存目录安装最新 OMO
+cd ~/.cache/opencode
+bun add oh-my-openagent@latest
+
+# 2. 清理旧包名（如果有）
+rm -rf ~/.cache/opencode/node_modules/oh-my-opencode
+
+# 3. 重新生成锁文件
+cd ~/.cache/opencode && bun install
+
+# 4. 重启 OpenCode
+```
+
+### TUI 界面不显示
+
+检查 `~/.config/opencode/tui.json` 是否包含 `oh-my-openagent/tui` 条目：
+
+```bash
+cat ~/.config/opencode/tui.json | grep oh-my-openagent/tui
+```
+
+如果没有，手动添加到 tui 列表中。
+
+### 旧包名残留
+
+如果升级后出现双版本问题：
+```bash
+cd ~/.cache/opencode
+rm -rf node_modules/oh-my-opencode
+# 并手动删除 package.json 中的 oh-my-opencode 依赖
+```
+
 ## Changelog
 
 见 [CHANGELOG.md](CHANGELOG.md)

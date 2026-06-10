@@ -4,7 +4,7 @@
 # Source oc-update's functions (we'll copy-paste the relevant ones)
 OC_PKG="opencode-ai"
 OMO_PKG_OLD="oh-my-opencode"
-OMO_PKG_NEW="@code-yeongyu/oh-my-opencode"
+OMO_PKG_NEW="oh-my-openagent"
 OMO_PKG="$OMO_PKG_NEW"
 OC_NAME="OpenCode"
 OMO_NAME="Oh-My-OpenCode"

@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-06-10
+
+### Added
+- **`do_auto()` 自动维护模式**: 新增 `auto` 子命令，4 阶段无人值守自动维护
+  （环境准备 → 扫描 → 自动修复 → 验证/报告），幂等设计，适合定时任务
+- **`--dry-run` 和 `--force` 标志**: 全局参数解析，支持试运行模式
+
+### Fixed
+- **OMO 升级在 arm64 平台失败**: bunx 在临时隔离环境中运行，找不到全局预装的
+  平台二进制包 (oh-my-openagent-linux-arm64)。改用 bun add -g + 手动 postinstall
+  替代 bunx，bun add -g 直接安装到全局目录，自动解析 optionalDependencies 中
+  的平台二进制包，安装后自动信任并运行 postinstall.mjs
+
+### Changed
+- **`_ensure_bun()` 提取复用**: 从 `do_bootstrap()` 提取为独立函数
+- **OMO 安装/更新自动安装 bun**: 缺失时自动调用 `_ensure_bun()`，移除 npx 降级路径
+- **`_safe_capture()` 辅助函数**: 消除 `set -e` + `local var=$(func)` 系统性 bug
+- **`bunx --bun` 修复 ESM shebang**: 某些平台 bunx 使用 node 运行，导致 ESM import 失败
+
+## [1.7.0] - 2026-06-02
+
+### Added
+- **`_ensure_bun()` 函数**: 从 `do_bootstrap()` 提取为独立可复用函数，npm registry → bun.sh → 二进制直链三层策略
+- **OMO 更新/安装自动安装 bun**: `update_package()` / `do_install()` 中 OMO 路径在 bun 缺失时自动调用 `_ensure_bun()` 安装
+- **PATH 残留检测**: `_check_stale_shadowing(pkg, cmd_name)` 扫描所有安装位置的同名命令，发现低版本残留时生成精确的 PM 卸载命令
+- **残留检测集成**: `update_package()` 更新后自动检查影子，`show_config()` 展示修复命令，`show_summary()` 显示一行概要
+- **PM 感知卸载命令**: 根据安装路径自动推断来源 PM: `~/.bun/*` → `bun remove -g`, `pnpm/*` → `pnpm remove -g`, 等等
+
+### Removed
+- **OMO 的 npx 降级路径**: OMO v4.6.0+ 硬依赖 bun，不再使用 npx fallback（npx 启动 OMO 安装器后内部 `spawnSync bun` 仍会 ENOTFOUND）
+- **`do_bootstrap()` 内联 bun 安装**: 全部替换为复用 `_ensure_bun()`
+
+## [1.6.0] - 2026-06-02
+
+### Added
+- **缓存版本检测**: `find_all_installations()` 现在扫描 OpenCode 插件缓存 (`~/.cache/opencode/node_modules/`)
+- **缓存一致性检查**: `show_config()` 新增缓存诊断区块，比对缓存 OMO 版本 vs 全局安装版本
+- **旧包名残留检测**: 自动检测缓存中是否残留 `oh-my-opencode`（已更名为 `oh-my-openagent`）
+- **TUI 配置漂移检测**: 检查 `tui.json` 是否包含 `oh-my-openagent/tui` 必要条目
+- **快速摘要警告**: `oc-update` 无参数运行时，发现缓存问题会显示简短警告
+
+## [1.5.0] - 2026-06-02
+
+### Added
+- **`bootstrap` 子命令**: 从零安装，自动检测并安装 bun（如缺失），再装 OpenCode + OMO
+  - bun 安装脚本通过 `get_url` 走 GitHub 代理链下载（中国网络可用），直连兜底
+  - 安装后自动将 `~/.bun/bin` 加入当前会话 PATH
+- **默认无参数显示摘要**: 直接运行 `oc-update` 显示简洁版本信息、包管理器和安装路径
+- **OMO 版本锁定支持**: `oc-update install --omo 4.6.0` 通过 `bunx oh-my-openagent@4.6.0 install` 实现
+- **OMO 安装器新增 flags**: 适配 v4.6.0 新增的 `--claude=no --gemini=no --copilot=no` 参数
+
+### Changed
+- **OMO 更新/安装改用 `bunx` 官方安装器**: 弃用 `bun add -g` / `npm install -g` 路径
+  - OMO 是 OpenCode 插件，必须通过官方安装器注册到 plugin 列表
+  - 无 bun 时自动降级到 `npx`，两者都不可用时硬错误提示
+- **bunx/npx OMO 调用包装 registry fallback**: `BUN_CONFIG_REGISTRY` 环境变量注入，遍历 npmmirror → USTC → npmjs.org
+  - 重试间清理 `~/.bun/install/cache/oh-my-openagent` 缓存
+- **`update_package()` OMO 路径重构**:
+  - 新增 `omo_pkg_spec` 变量支持版本锁定
+  - 移除 PM 全局安装降级路径（不再 `npm install -g oh-my-openagent`）
+  - 失败时返回硬错误 + 引导提示
+
+### Fixed
+- **`load_nvm()` 触发 `set -e` 导致 `update_package()` 静默退出**: `load_nvm` 末尾 `return 1` 在没有 nvm 的机器上导致函数中断，改为 `load_nvm || true`
+- **OMO 安装器 flags 兼容性**: `--skip-auth` 在 v4.6.0 中被废弃，新增 `--claude=no --gemini=no --copilot=no`
+
+### Network (中国网络优化)
+- **无包管理器安装 OC**: 新增三层 fallback 链
+  1. 直连 `opencode.ai/install`（VPN 用户）
+  2. `get_url()` 从 GitHub raw 下载安装脚本（5 节点代理链）
+  3. 全部失败→打印 bun/npm+镜像/手动下载等多种替代方案
+
 ## [1.2.7] - 2026-04-21
 
 ### 🐛 修复检测bug
