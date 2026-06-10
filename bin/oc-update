@@ -1,12 +1,14 @@
 #!/bin/bash
 #
-# oc-update - Manage OpenCode and Oh-My-OpenCode updates
+# oc-update - Manage OpenCode and Oh-My-OpenCode (install, update, config)
 #
 # Usage:
-#   oc-update check [--oc|--omo]     # Check for updates (prompt to update)
-#   oc-update update [--oc|--omo]    # Update directly without prompt
-#   oc-update disable [oc|omo|all]   # Disable auto-update
-#   oc-update enable [oc|omo|all]    # Enable auto-update
+#   oc-update check [--oc|--omo]       # Check for updates (prompt to update)
+#   oc-update update [--oc|--omo]      # Update directly without prompt
+#   oc-update install [--oc|--omo]     # Install from scratch (skip if already installed)
+#   oc-update bootstrap [--oc|--omo]   # Bootstrap from zero: install PM + OC + OMO
+#   oc-update disable [oc|omo|all]     # Disable auto-update
+#   oc-update enable [oc|omo|all]      # Enable auto-update
 #   oc-update config                 # Show current config
 #   oc-update --help                 # Show help
 #
@@ -17,8 +19,18 @@ if [ -z "$BASH_VERSION" ]; then
     exit 1
 fi
 
-# 全局错误捕获
-trap 'echo -e "\n${RED}❌ 执行错误${NC}：行号 $LINENO，命令：$BASH_COMMAND，返回码：$?" >&2; exit 1' ERR
+# 启用extglob以支持trap中的模式匹配（必须在ERR trap之前）
+shopt -s extglob 2>/dev/null || true
+
+# 全局错误捕获（清洗敏感信息后显示）
+trap 'cmd="$BASH_COMMAND"; cmd="${cmd//--registry=*([![:space:]])/--registry=***}"; cmd="${cmd//--token=*([![:space:]])/--token=***}"; echo -e "\n${RED}❌ 执行错误${NC}：行号 $LINENO，命令：$cmd，返回码：$?" >&2; exit 1' ERR
+
+# EXIT trap: 清理临时文件
+TEMP_FILES=()
+_cleanup_temp_files() {
+    rm -f "${TEMP_FILES[@]}" 2>/dev/null || true
+}
+trap _cleanup_temp_files EXIT
 
 set -euo pipefail
 
@@ -89,6 +101,36 @@ NPM_REGISTRIES=(
     "https://registry.npmjs.org"
 )
 
+# 包管理器检测优先级（按顺序尝试）
+PM_PRIORITY=(pnpm yarn npm)
+# NVM 目录默认值（用户未设置时生效）
+NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+
+# sed -i 跨平台兼容（macOS BSD sed vs GNU sed）
+SED_INPLACE=(-i)
+[[ "$(uname -s)" == "Darwin" ]] && SED_INPLACE=(-i '')
+
+# 纯 bash 语义化版本比较函数（替代 sort -V）
+# 返回值：0 = $1 > $2, 1 = $1 <= $2
+version_gt() {
+    local a="${1#v}" b="${2#v}"
+    # 支持 pre-release 标签（1.2.3-beta.1），直接截断到三段数字
+    a="${a%%[-+]*}" b="${b%%[-+]*}"
+    # 标准化为 x.y.z，补全缺失段
+    local IFS=.
+    local a_parts=($a) b_parts=($b)
+    for i in 0 1 2; do
+        local seg_a="${a_parts[$i]:-0}"
+        local seg_b="${b_parts[$i]:-0}"
+        # 过滤非数字，容错
+        seg_a="${seg_a//[!0-9]/0}"
+        seg_b="${seg_b//[!0-9]/0}"
+        ((10#$seg_a > 10#$seg_b)) && return 0
+        ((10#$seg_a < 10#$seg_b)) && return 1
+    done
+    return 1  # 相等
+}
+
 # 系统架构检测
 ARCH="$(uname -m | tr '[:upper:]' '[:lower:]')"
 IS_AARCH64="false"
@@ -100,10 +142,10 @@ fi
 
 # Package info
 OC_PKG="opencode-ai"
-# OMO官方npm包名是 oh-my-opencode
+# OMO官方npm包名是 oh-my-opencode（旧）和 oh-my-openagent（新，主推）
 OMO_PKG_OLD="oh-my-opencode"
-OMO_PKG_NEW=""
-OMO_PKG="$OMO_PKG_OLD"
+OMO_PKG_NEW="oh-my-openagent"
+OMO_PKG="$OMO_PKG_NEW"
 OC_NAME="OpenCode"
 OMO_NAME="Oh-My-OpenCode"
 OC_REPO="anomaly/opencode"
@@ -113,9 +155,10 @@ OMO_REPO="code-yeongyu/oh-my-openagent"
 CONFIG_DIR="$HOME/.config/opencode"
 OC_CONFIG="$CONFIG_DIR/opencode.json"
 OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
+OMO_CONFIG_NEW="$CONFIG_DIR/oh-my-openagent.json"
 
 # Version
-VERSION="1.5.0"
+VERSION="1.8.0"
 
 # Flags
 CHECK_OC=true
@@ -127,6 +170,9 @@ OC_PKG_FOUND=${OC_PKG_FOUND:-}
 OMO_NOT_IN_PATH=${OMO_NOT_IN_PATH:-}
 OMO_PKG_FOUND=${OMO_PKG_FOUND:-}
 REMOTE_FETCH_FAILED=${REMOTE_FETCH_FAILED:-}
+DRY_RUN="${DRY_RUN:-false}"
+FORCE="${FORCE:-false}"
+AUTO_EXIT_CODE="${AUTO_EXIT_CODE:-0}"
 
 # ============================================
 # Utilities
@@ -137,6 +183,339 @@ log_debug() {
     if [[ "${DEBUG:-false}" == "true" ]]; then
         echo -e "\033[0;34m[DEBUG]\033[0m $*" >&2
     fi
+}
+
+# ============================================
+# OpenCode 缓存检测函数（只读，v1.6.0）
+# ============================================
+
+# 获取 OpenCode 插件缓存目录路径
+_cache_path() {
+    # XDG_CACHE_HOME 优先
+    if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+        echo "$XDG_CACHE_HOME/opencode"
+        return 0
+    fi
+    # macOS
+    case "$(uname -s)" in
+        Darwin) echo "$HOME/Library/Caches/opencode" ;;
+        *)      echo "$HOME/.cache/opencode" ;;
+    esac
+}
+
+# 获取 OpenCode 缓存中 OMO 版本（新旧包名均支持）
+# 输出: "x.y.z" 或 "no-cache"（无缓存目录）或 "not-found"（无 OMO 包）
+_cache_omo_version() {
+    local cache_dir
+    cache_dir=$(_cache_path)
+
+    if [[ -z "$cache_dir" || ! -d "$cache_dir/node_modules" ]]; then
+        echo "no-cache"
+        return 1
+    fi
+
+    # 优先检查新包名 oh-my-openagent
+    local pkg_json="$cache_dir/node_modules/$OMO_PKG_NEW/package.json"
+    if [[ -f "$pkg_json" ]]; then
+        local ver
+        ver=$(grep '"version"' "$pkg_json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+        if [[ -n "$ver" ]]; then
+            echo "$ver"
+            return 0
+        fi
+    fi
+
+    # 回退检查旧包名 oh-my-opencode
+    pkg_json="$cache_dir/node_modules/$OMO_PKG_OLD/package.json"
+    if [[ -f "$pkg_json" ]]; then
+        local ver
+        ver=$(grep '"version"' "$pkg_json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+        if [[ -n "$ver" ]]; then
+            echo "$ver"
+            return 0
+        fi
+    fi
+
+    echo "not-found"
+    return 1
+}
+
+# 检测 OpenCode 缓存中是否残留旧包名 oh-my-opencode
+# 返回 0=存在残留, 1=无残留
+_cache_has_old_pkg() {
+    local cache_dir
+    cache_dir=$(_cache_path)
+    [[ -z "$cache_dir" ]] && return 1
+
+    # 检查旧包目录是否存在
+    if [[ -d "$cache_dir/node_modules/$OMO_PKG_OLD" ]]; then
+        return 0
+    fi
+
+    # 检查缓存根目录 package.json 是否仍引用旧包名
+    if [[ -f "$cache_dir/package.json" ]]; then
+        if grep -q "\"$OMO_PKG_OLD\"" "$cache_dir/package.json" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# 清理缓存中残留的旧包名（oh-my-opencode → oh-my-openagent）
+# 在 OMO 升级/安装成功后调用，幂等
+_cache_clean_old_pkg() {
+    local cache_dir
+    cache_dir=$(_cache_path)
+    [[ -z "$cache_dir" ]] && return 0
+
+    local cleaned=false
+    local old_dir="$cache_dir/node_modules/$OMO_PKG_OLD"
+
+    # 删除旧包目录
+    if [[ -d "$old_dir" ]]; then
+        rm -rf "$old_dir" 2>/dev/null && echo -e "  ${GREEN}✓ 已清理缓存旧包目录 ${OMO_PKG_OLD}${NC}" && cleaned=true
+    fi
+
+    # 从 package.json 移除旧包引用（跨平台: python3 > sed-with-N）
+    local pkg_json="$cache_dir/package.json"
+    if [[ -f "$pkg_json" ]]; then
+        if grep -q "\"$OMO_PKG_OLD\"" "$pkg_json" 2>/dev/null; then
+            local json_ok=false
+            # 策略 1: python3 做 JSON 操作（macOS/Linux 通用）
+            if command -v python3 &>/dev/null; then
+                python3 -c "
+import json, sys
+try:
+    with open('$pkg_json', 'r') as f:
+        data = json.load(f)
+    data.get('dependencies', {}).pop('$OMO_PKG_OLD', None)
+    with open('$pkg_json', 'w') as f:
+        json.dump(data, f, indent=2)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null && json_ok=true
+            fi
+            # 策略 2: sed 行删除 + 尾部逗号清理（跨平台: GNU + BSD sed）
+            if [[ "$json_ok" == false ]]; then
+                sed -i'.bak' "/\"$OMO_PKG_OLD\"/d" "$pkg_json" 2>/dev/null
+                # 清理尾部逗号: "x": "y",\n} → 删除逗号（兼容 GNU/BSD sed）
+                sed -i'.bak' -e '/,$/{' -e 'N' -e 's/,[[:space:]]*\n\([[:space:]]*\)}/\n\1}/' -e '}' "$pkg_json" 2>/dev/null || true
+                rm -f "${pkg_json}.bak"
+                json_ok=true
+            fi
+            if [[ "$json_ok" == true ]]; then
+                echo -e "  ${GREEN}✓ 已从缓存 package.json 移除 ${OMO_PKG_OLD}${NC}"
+                cleaned=true
+            fi
+        fi
+    fi
+
+    [[ "$cleaned" == false ]] && return 1
+    # 提示重启
+    echo -e "  ${BLUE}💡 请重启 OpenCode 以使用最新 OMO 插件${NC}"
+}
+
+# 确保 omo 命令可用（创建软链接）
+_ensure_omo_symlink() {
+    local omo_cmd
+    omo_cmd=$(command -v omo 2>/dev/null || command -v oh-my-openagent 2>/dev/null)
+    if [[ -z "$omo_cmd" ]]; then
+        for omo_candidate in "$HOME/.bun/bin/oh-my-openagent" "$HOME/.local/bin/oh-my-openagent" "$HOME/.npm-global/bin/oh-my-openagent"; do
+            if [[ -x "$omo_candidate" ]]; then
+                omo_cmd="$omo_candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -n "$omo_cmd" && ! -L "${omo_cmd%/*}/omo" ]]; then
+        ln -sf "$omo_cmd" "${omo_cmd%/*}/omo" 2>/dev/null || true
+        echo -e "  ${BLUE}已创建 omo 命令别名${NC}"
+    fi
+}
+
+# 检查 tui.json 中是否包含 OMO 必要条目
+# 输出: "ok" | "missing-entry" | "missing-file"
+_check_tui_config() {
+    local tui_file="$CONFIG_DIR/tui.json"
+
+    if [[ ! -f "$tui_file" ]]; then
+        echo "missing-file"
+        return 1
+    fi
+
+    if grep -qE '(oh-my-openagent/tui|oh-my-openagent\\/tui)' "$tui_file" 2>/dev/null; then
+        echo "ok"
+        return 0
+    fi
+
+    echo "missing-entry"
+    return 1
+}
+
+# 缓存一致性综合检查：版本比对 + 旧包名残留 + TUI 配置漂移
+# 输出警告信息，返回 0=无问题, 1=发现问题
+_warn_cache_mismatch() {
+    local cache_ver
+    cache_ver=$(_cache_omo_version)
+    [[ "$cache_ver" == "no-cache" || "$cache_ver" == "not-found" ]] && return 0
+
+    local issues_found=false
+
+    # 获取全局安装版本
+    local global_path
+    global_path=$(_safe_capture find_package_path "$OMO_PKG")
+    local global_ver=""
+    if [[ -n "$global_path" && -f "$global_path/package.json" ]]; then
+        global_ver=$(grep '"version"' "$global_path/package.json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+    fi
+
+    # 检查1: 版本不一致
+    if [[ -n "$global_ver" && "$global_ver" != "$cache_ver" ]]; then
+        echo -e "  ${YELLOW}⚠ OMO 缓存版本与全局版本不一致${NC}"
+        echo -e "    全局安装: ${CYAN}v$global_ver${NC}  →  缓存: ${YELLOW}v$cache_ver${NC}"
+        echo -e "    OpenCode 实际使用缓存版本，更新全局不会生效！"
+        echo -e "    ${BOLD}修复:${NC}"
+        echo -e "      cd '$(_cache_path)' && bun add $OMO_PKG_NEW@latest"
+        echo -e "      然后重启 OpenCode"
+        issues_found=true
+    fi
+
+    # 检查2: 旧包名残留
+    if _cache_has_old_pkg; then
+        echo -e "  ${YELLOW}⚠ 缓存中存在旧包名 $OMO_PKG_OLD${NC}"
+        echo -e "    ${BOLD}修复:${NC}"
+        echo -e "      rm -rf '$(_cache_path)/node_modules/$OMO_PKG_OLD'"
+        echo -e "      并删除 $(_cache_path)/package.json 中的 \"$OMO_PKG_OLD\" 依赖项"
+        issues_found=true
+    fi
+
+    # 检查3: TUI 配置漂移
+    local tui_status
+    tui_status=$(_check_tui_config)
+    case "$tui_status" in
+        missing-entry)
+            echo -e "  ${YELLOW}⚠ TUI 配置缺失 oh-my-openagent/tui 条目${NC}"
+            echo -e "    OpenCode 可能无法加载 OMO 的 TUI 界面"
+            echo -e "    ${BOLD}修复:${NC}"
+            echo -e "      在 $CONFIG_DIR/tui.json 中添加 \"oh-my-openagent/tui\""
+            issues_found=true
+            ;;
+        missing-file)
+            echo -e "  ${YELLOW}⚠ TUI 配置文件不存在${NC}"
+            echo -e "    路径: $CONFIG_DIR/tui.json"
+            echo -e "    重新安装 OMO 可自动生成"
+            issues_found=false  # 首次安装未生成 tui.json 不算问题
+            ;;
+    esac
+
+    [[ "$issues_found" == true ]] && return 1 || return 0
+}
+
+# 检测 OMO 是否作为 OpenCode 插件注册（OMO v4.6.0+ 插件架构）
+# 不依赖物理 package 目录，只检查 opencode.json 和 oh-my-openagent.json 配置
+# 输出: 插件配置路径（如 oh-my-openagent.json），空 = 未注册
+_detect_omo_plugin() {
+    local _config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+    local _oc_config="$_config_dir/opencode/opencode.json"
+    local _omo_config_file="$_config_dir/opencode/oh-my-openagent.json"
+
+    # 主检测：opencode.json 中 plugin 字段包含 oh-my-openagent
+    if [[ -f "$_oc_config" ]]; then
+        # 匹配 "oh-my-openagent"、"oh-my-openagent@latest"、"oh-my-openagent@4.8.1" 等
+        if grep -qE '"oh-my-openagent(@latest|@[0-9]+\.[0-9]+\.[0-9]+)?"' "$_oc_config" 2>/dev/null; then
+            log_debug "在 opencode.json 中检测到 OMO 插件注册"
+            echo "$_omo_config_file"
+            return 0
+        fi
+    fi
+
+    # 回退检测：oh-my-openagent.json 配置文件存在
+    if [[ -f "$_omo_config_file" ]]; then
+        log_debug "通过 oh-my-openagent.json 检测到 OMO 插件配置"
+        echo "$_omo_config_file"
+        return 0
+    fi
+
+    log_debug "未检测到 OMO 插件注册"
+    echo ""
+    return 1
+}
+
+# 检测 PATH 遮蔽：扫描所有安装，对旧版本给出精确卸载命令
+# 参数: pkg (包名), cmd_name (命令名, 如 "omo"/"opencode")
+# 输出: 直接打印警告信息，返回 0=无遮蔽, 1=发现潜在遮蔽
+_check_stale_shadowing() {
+    local pkg="$1"
+    local cmd_name="$2"
+
+    local other_installations
+    other_installations=$(find_all_installations "$pkg" "$cmd_name")
+    [[ -z "$other_installations" ]] && return 0
+
+    local primary_path
+    primary_path=$(_safe_capture find_package_path "$pkg")
+    local primary_ver=""
+    if [[ -n "$primary_path" && -f "$primary_path/package.json" ]]; then
+        primary_ver=$(grep '"version"' "$primary_path/package.json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+    fi
+
+    local cache_root
+    cache_root=$(_safe_capture _cache_path)
+
+    local shadow_found=false
+    for inst in $other_installations; do
+        local inst_path="${inst%%|*}"
+        local inst_ver="${inst#*|}"
+        # 跳过主安装和缓存目录（缓存不在 PATH 中，不构成遮蔽）
+        [[ "$inst_path" == "$primary_path" ]] && continue
+        [[ -n "$cache_root" && "$inst_path" == "$cache_root/node_modules/"* ]] && continue
+
+        # 推断该路径对应的包管理器类型（用于生成精确卸载命令）
+        local shadow_pm="npm"
+        # 使用实际目录名作为卸载包名（处理新旧包名差异，如 oh-my-opencode vs oh-my-openagent）
+        local uninstall_pkg="$pkg"
+        local dir_basename; dir_basename=$(basename "$inst_path")
+        [[ "$dir_basename" != "$pkg" ]] && uninstall_pkg="$dir_basename"
+        [[ "$inst_path" == *"/.bun/install/global/"* ]] && shadow_pm="bun"
+        [[ "$inst_path" == *"/.local/share/pnpm/"* ]] && shadow_pm="pnpm"
+        [[ "$inst_path" == *"/yarn/"* ]] && shadow_pm="yarn"
+
+        local uninstall_cmd
+        case "$shadow_pm" in
+            bun)  uninstall_cmd="bun remove -g $uninstall_pkg" ;;
+            pnpm) uninstall_cmd="pnpm remove -g $uninstall_pkg" ;;
+            yarn) uninstall_cmd="yarn global remove $uninstall_pkg" ;;
+            npm)  uninstall_cmd="npm uninstall -g $uninstall_pkg" ;;
+            *)    uninstall_cmd="npm uninstall -g $uninstall_pkg" ;;
+        esac
+
+        # 判断版本：旧版本 → 潜在遮蔽警告；同版本 → 冗余提示
+        if [[ -n "$inst_ver" && -n "$primary_ver" ]]; then
+            if version_gt "$primary_ver" "$inst_ver"; then
+                echo -e "  ${YELLOW}⚠ 旧版本遮挡风险: $inst_path (v${inst_ver:-?})${NC}"
+                echo -e "    此版本 (v$inst_ver) < 当前版本 (v$primary_ver)，在 PATH 中可能遮挡新安装"
+                echo -e "    ${BOLD}修复:${NC} $uninstall_cmd"
+                shadow_found=true
+            else
+                echo -e "  ${BLUE}ℹ 冗余安装: $inst_path (v${inst_ver:-?})${NC}"
+                echo -e "    版本相同或更新，建议清理避免混淆: $uninstall_cmd"
+            fi
+        else
+            # 无法比较版本，直接标记为可疑
+            echo -e "  ${YELLOW}⚠ 多余安装: $inst_path (v${inst_ver:-?})${NC}"
+            echo -e "    可能遮挡当前版本，建议清理: $uninstall_cmd"
+            shadow_found=true
+        fi
+    done
+
+    if [[ "$shadow_found" == true ]]; then
+        echo -e "  ${YELLOW}提示: 如果更新后 '$cmd_name --version' 仍显示旧版本号，${NC}"
+        echo -e "  ${YELLOW}       请运行上面的卸载命令，然后 'hash -r' 或重启终端${NC}"
+    fi
+
+    [[ "$shadow_found" == true ]] && return 1 || return 0
 }
 
 # 通用GitHub资源请求函数，自动走代理重试
@@ -176,10 +555,9 @@ get_url() {
 
 check_deps() {
     local missing=()
-    # 不需要强制npm，因为可以走手动安装fallback
-    # 手动安装需要curl和tar
     command -v curl &> /dev/null || missing+=("curl")
     command -v tar &> /dev/null || missing+=("tar")
+    command -v unzip &> /dev/null || missing+=("unzip")
     
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "${RED}错误: 缺少必要依赖: ${missing[*]}${NC}"
@@ -209,16 +587,15 @@ run_with_retry() {
         esac
     done
     
-    local cmd="$*"
-    local timeout_prefix=""
+    local timeout_prefix=()
     if command -v timeout >/dev/null; then
-        timeout_prefix="timeout -k 3s ${timeout}s"
+        timeout_prefix=(timeout -k 3s "${timeout}s")
     fi
     
     for ((attempt=0; attempt<retries; attempt++)); do
-        log_debug "  命令执行尝试 $((attempt+1))/$retries：$cmd"
+        log_debug "  命令执行尝试 $((attempt+1))/$retries：$*"
         # 实时输出日志，方便用户查看进度
-        eval "$timeout_prefix $cmd" 2>&1
+        "${timeout_prefix[@]}" "$@" 2>&1
         local exit_code=$?
         if [[ $exit_code -eq 0 ]]; then
             return 0
@@ -253,12 +630,24 @@ get_oc_autoupdate() {
     fi
 }
 
+# 获取OMO配置文件路径（新名优先，旧名fallback）
+_omo_config_path() {
+    if [[ -f "$OMO_CONFIG_NEW" ]]; then
+        echo "$OMO_CONFIG_NEW"
+    elif [[ -f "$OMO_CONFIG" ]]; then
+        echo "$OMO_CONFIG"
+    else
+        echo "$OMO_CONFIG_NEW"  # 默认写新名
+    fi
+}
+
 get_omo_auto_update() {
-    if [[ -f "$OMO_CONFIG" ]]; then
+    local cfg; cfg=$(_omo_config_path)
+    if [[ -f "$cfg" ]]; then
         if has_jq; then
-            jq -r '.auto_update // false' "$OMO_CONFIG" 2>/dev/null
+            jq -r '.auto_update // false' "$cfg" 2>/dev/null
         else
-            grep -o '"auto_update"[[:space:]]*:[[:space:]]*[^,}]*' "$OMO_CONFIG" 2>/dev/null | \
+            grep -o '"auto_update"[[:space:]]*:[[:space:]]*[^,}]*' "$cfg" 2>/dev/null | \
                 sed 's/.*:[[:space:]]*//' | tr -d ' ",' | head -1
         fi
     else
@@ -267,12 +656,13 @@ get_omo_auto_update() {
 }
 
 is_omo_hook_disabled() {
-    if [[ -f "$OMO_CONFIG" ]]; then
+    local cfg; cfg=$(_omo_config_path)
+    if [[ -f "$cfg" ]]; then
         if has_jq; then
-            jq -e '.disabled_hooks[] | select(. == "auto-update-checker")' "$OMO_CONFIG" &>/dev/null
+            jq -e '.disabled_hooks[] | select(. == "auto-update-checker")' "$cfg" &>/dev/null
             return $?
         else
-            grep -q '"auto-update-checker"' "$OMO_CONFIG" 2>/dev/null
+            grep -q '"auto-update-checker"' "$cfg" 2>/dev/null
             return $?
         fi
     fi
@@ -284,43 +674,56 @@ set_oc_autoupdate() {
     [[ ! -f "$OC_CONFIG" ]] && { echo -e "${RED}✗ 配置文件不存在: $OC_CONFIG${NC}"; return 1; }
     if has_jq; then
         local tmp; tmp=$(mktemp)
+        TEMP_FILES+=("$tmp")
         jq --arg v "$value" '.autoupdate = ($v | if $v == "true" then true elif $v == "false" then false else $v end)' \
             "$OC_CONFIG" > "$tmp" && mv "$tmp" "$OC_CONFIG"
     else
-        sed -i "s/\"autoupdate\"[[:space:]]*:[[:space:]]*[^,}]*/\"autoupdate\": $value/" "$OC_CONFIG"
+        sed "${SED_INPLACE[@]}" "s/\"autoupdate\"[[:space:]]*:[[:space:]]*[^,}]*/\"autoupdate\": $value/" "$OC_CONFIG"
     fi
 }
 
 set_omo_auto_update() {
     local value="$1"
-    [[ ! -f "$OMO_CONFIG" ]] && { echo -e "${RED}✗ 配置文件不存在: $OMO_CONFIG${NC}"; return 1; }
+    local cfg; cfg=$(_omo_config_path)
+    [[ ! -f "$cfg" ]] && { echo -e "${RED}✗ 配置文件不存在: $cfg${NC}"; return 1; }
     if has_jq; then
         local tmp; tmp=$(mktemp)
-        jq --argjson v "$value" '.auto_update = $v' "$OMO_CONFIG" > "$tmp" && mv "$tmp" "$OMO_CONFIG"
+        TEMP_FILES+=("$tmp")
+        jq --argjson v "$value" '.auto_update = $v' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
     else
-        sed -i "s/\"auto_update\"[[:space:]]*:[[:space:]]*[^,}]*/\"auto_update\": $value/" "$OMO_CONFIG"
+        sed "${SED_INPLACE[@]}" "s/\"auto_update\"[[:space:]]*:[[:space:]]*[^,}]*/\"auto_update\": $value/" "$cfg"
     fi
 }
 
 add_omo_disabled_hook() {
-    [[ ! -f "$OMO_CONFIG" ]] && return 1
+    local cfg; cfg=$(_omo_config_path)
+    [[ ! -f "$cfg" ]] && return 1
     is_omo_hook_disabled && return 0
     if has_jq; then
         local tmp; tmp=$(mktemp)
-        jq '.disabled_hooks = (.disabled_hooks // []) + ["auto-update-checker"]' "$OMO_CONFIG" > "$tmp" && mv "$tmp" "$OMO_CONFIG"
+        TEMP_FILES+=("$tmp")
+        jq '.disabled_hooks = (.disabled_hooks // []) + ["auto-update-checker"]' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
     else
-        sed -i 's/"disabled_hooks"[[:space:]]*:[[:space:]]*\[/&"auto-update-checker", /' "$OMO_CONFIG"
+        # 安全处理：检查disabled_hooks数组是否存在，已有元素则追加，否则创建
+        if grep -q '"disabled_hooks"' "$cfg" 2>/dev/null; then
+            sed "${SED_INPLACE[@]}" 's/"disabled_hooks"[[:space:]]*:[[:space:]]*\[/&"auto-update-checker", /' "$cfg"
+        else
+            # 在配置末尾追加disabled_hooks数组
+            sed "${SED_INPLACE[@]}" 's/}[[:space:]]*$/, "disabled_hooks": ["auto-update-checker"] }/' "$cfg"
+        fi
     fi
 }
 
 remove_omo_disabled_hook() {
-    [[ ! -f "$OMO_CONFIG" ]] && return 1
+    local cfg; cfg=$(_omo_config_path)
+    [[ ! -f "$cfg" ]] && return 1
     if has_jq; then
         local tmp; tmp=$(mktemp)
-        jq '.disabled_hooks = [.disabled_hooks[] | select(. != "auto-update-checker")]' "$OMO_CONFIG" > "$tmp" && mv "$tmp" "$OMO_CONFIG"
+        TEMP_FILES+=("$tmp")
+        jq '.disabled_hooks = [.disabled_hooks[] | select(. != "auto-update-checker")]' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
     else
-        sed -i 's/"auto-update-checker"[[:space:]]*,[[:space:]]*//' "$OMO_CONFIG"
-        sed -i 's/,[[:space:]]*"auto-update-checker"//' "$OMO_CONFIG"
+        sed "${SED_INPLACE[@]}" 's/"auto-update-checker"[[:space:]]*,[[:space:]]*//' "$cfg"
+        sed "${SED_INPLACE[@]}" 's/,[[:space:]]*"auto-update-checker"//' "$cfg"
     fi
 }
 
@@ -341,7 +744,6 @@ is_omo_disabled() {
 # 检测包管理器类型
 detect_package_manager() {
     local pkg="$1"
-    log_debug "开始检测$pkg对应的包管理器..."
     log_debug "开始检测$pkg对应的包管理器..."
     # OMO特殊处理：尝试新旧包名
     local pkgs_to_check=("$pkg")
@@ -498,47 +900,81 @@ find_package_path() {
 
     # 方法 2: 通过包管理器 list 命令查找
     log_debug "尝试通过包管理器命令查找安装路径..."
-    # 检查npm
-    if command -v npm &>/dev/null; then
-        local npm_path=$(npm list -g "$pkg" --parseable 2>/dev/null | head -1)
-        if [[ -n "$npm_path" && -f "$npm_path/package.json" ]]; then
-            log_debug "通过npm找到安装路径：$npm_path"
-            echo "$npm_path"
-            return 0
-        fi
+    # OMO双包名：定义一个 helper 尝试多个包名
+    local search_pkgs=("$pkg")
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        [[ "$pkg" == "$OMO_PKG_OLD" ]] && search_pkgs+=("$OMO_PKG_NEW") || search_pkgs+=("$OMO_PKG_OLD")
     fi
+    
+    local spkg
+    for spkg in "${search_pkgs[@]}"; do
+        # 检查npm
+        if command -v npm &>/dev/null; then
+            local npm_path=$(npm list -g "$spkg" --parseable 2>/dev/null | head -1)
+            if [[ -n "$npm_path" ]]; then
+                if [[ -f "$npm_path/package.json" ]]; then
+                    log_debug "通过npm找到安装路径：$npm_path"
+                    echo "$npm_path"
+                    return 0
+                else
+                    # 目录存在但无package.json → broken install，记录路径用于后续提示
+                    log_debug "通过npm找到$spkg，但package.json缺失（broken install）"
+                    export BROKEN_PKG_PATH="$npm_path"
+                fi
+            fi
+        fi
 
-    # 检查pnpm
-    if command -v pnpm &>/dev/null; then
-        local pnpm_path=$(pnpm list -g "$pkg" --parseable 2>/dev/null | head -1)
-        if [[ -n "$pnpm_path" && -f "$pnpm_path/package.json" ]]; then
-            log_debug "通过pnpm找到安装路径：$pnpm_path"
-            echo "$pnpm_path"
-            return 0
+        # 检查pnpm
+        if command -v pnpm &>/dev/null; then
+            local pnpm_path=$(pnpm list -g "$spkg" --parseable 2>/dev/null | head -1)
+            if [[ -n "$pnpm_path" ]]; then
+                if [[ -f "$pnpm_path/package.json" ]]; then
+                    log_debug "通过pnpm找到安装路径：$pnpm_path"
+                    echo "$pnpm_path"
+                    return 0
+                else
+                    log_debug "通过pnpm找到$spkg，但package.json缺失（broken install）"
+                    export BROKEN_PKG_PATH="$pnpm_path"
+                fi
+            fi
         fi
-    fi
 
-    # 检查yarn
-    if command -v yarn &>/dev/null; then
-        local yarn_path=$(yarn global list --pattern "$pkg" --parseable 2>/dev/null | head -1)
-        if [[ -n "$yarn_path" && -f "$yarn_path/package.json" ]]; then
-            log_debug "通过yarn找到安装路径：$yarn_path"
-            echo "$yarn_path"
-            return 0
+        # 检查yarn
+        if command -v yarn &>/dev/null; then
+            local yarn_path=$(yarn global list --pattern "$spkg" --parseable 2>/dev/null | head -1)
+            if [[ -n "$yarn_path" ]]; then
+                if [[ -f "$yarn_path/package.json" ]]; then
+                    log_debug "通过yarn找到安装路径：$yarn_path"
+                    echo "$yarn_path"
+                    return 0
+                else
+                    log_debug "通过yarn找到$spkg，但package.json缺失（broken install）"
+                    export BROKEN_PKG_PATH="$yarn_path"
+                fi
+            fi
         fi
-    fi
+    done
 
     # 方法 3: 搜索常见全局安装目录
-    log_debug "尝试搜索常见安装目录..."
-    local search_dirs=(
-        "$HOME/.local/lib/node_modules/$pkg"
-        "$HOME/.nvm/versions/node/*/lib/node_modules/$pkg"
-        "$HOME/.fnm/node-versions/*/lib/node_modules/$pkg"
-        "$HOME/.bun/install/global/node_modules/$pkg"
-        "$HOME/.local/share/pnpm/global/*/node_modules/$pkg"
-        "/usr/local/lib/node_modules/$pkg"
-        "/usr/lib/node_modules/$pkg"
-    )
+    # OMO双包名：同时搜索新旧两个包名
+    local search_dirs=()
+    local search_pkgs_dir=("$pkg")
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        [[ "$pkg" == "$OMO_PKG_OLD" ]] && search_pkgs_dir+=("$OMO_PKG_NEW") || search_pkgs_dir+=("$OMO_PKG_OLD")
+    fi
+    local _config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+    for spkg_dir in "${search_pkgs_dir[@]}"; do
+        search_dirs+=(
+            "$HOME/.local/lib/node_modules/$spkg_dir"
+            "$HOME/.nvm/versions/node/*/lib/node_modules/$spkg_dir"
+            "$HOME/.fnm/node-versions/*/lib/node_modules/$spkg_dir"
+            "$HOME/.bun/install/global/node_modules/$spkg_dir"
+            "$HOME/.local/share/pnpm/global/*/node_modules/$spkg_dir"
+            "/usr/local/lib/node_modules/$spkg_dir"
+            "/usr/lib/node_modules/$spkg_dir"
+            "$_config_dir/opencode/node_modules/$spkg_dir"
+        )
+    done
 
     for dir_pattern in "${search_dirs[@]}"; do
         # 使用通配符匹配多个版本
@@ -550,22 +986,118 @@ find_package_path() {
         # 恢复原来的设置
         eval "$old_nullglob" 2>/dev/null || true
         for dir in "${matching_dirs[@]}"; do
-            if [[ -d "$dir" && -f "$dir/package.json" ]]; then
-                log_debug "通过目录搜索找到安装路径：$dir"
-                echo "$dir"
-                return 0
+            if [[ -d "$dir" ]]; then
+                if [[ -f "$dir/package.json" ]]; then
+                    log_debug "通过目录搜索找到安装路径：$dir"
+                    echo "$dir"
+                    return 0
+                else
+                    log_debug "通过目录搜索找到$dir，但package.json缺失（broken install）"
+                    export BROKEN_PKG_PATH="$dir"
+                fi
             fi
         done
     done
 
-    # 所有方法都没找到
+    # 所有方法都没找到，但如果记录了broken路径，仍然返回它让调用方展示
+    if [[ -n "${BROKEN_PKG_PATH:-}" ]]; then
+        log_debug "返回broken安装路径：$BROKEN_PKG_PATH"
+        echo "$BROKEN_PKG_PATH"
+        return 0
+    fi
+
+    # 最终熔断：对于 OMO，检查是否作为 OpenCode 插件注册（omo v4.6.0+ 插件架构）
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        local _plugin_path; _plugin_path=$(_detect_omo_plugin)
+        if [[ -n "$_plugin_path" ]]; then
+            log_debug "OMO 作为 OpenCode 插件注册，配置路径：$_plugin_path"
+            export OMO_PLUGIN_REGISTERED=1
+            echo "$_plugin_path"
+            return 0
+        fi
+    fi
+
     log_debug "未找到$pkg的安装路径"
     echo ""
     return 1
 }
 
-main() {
-    echo ""
+# 扫描所有安装路径（用于检测多版本冲突）
+find_all_installations() {
+    local pkg="$1"
+    local cmd_name="$2"
+    local results=()
+    
+    local search_pkgs_all=("$pkg")
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        [[ "$pkg" == "$OMO_PKG_OLD" ]] && search_pkgs_all+=("$OMO_PKG_NEW") || search_pkgs_all+=("$OMO_PKG_OLD")
+    fi
+    
+    local spkg_all
+    for spkg_all in "${search_pkgs_all[@]}"; do
+        local search_dirs=(
+            "$HOME/.local/lib/node_modules/$spkg_all"
+            "$HOME/.nvm/versions/node/*/lib/node_modules/$spkg_all"
+            "$HOME/.fnm/node-versions/*/lib/node_modules/$spkg_all"
+            "$HOME/.bun/install/global/node_modules/$spkg_all"
+            "$HOME/.local/share/pnpm/global/*/node_modules/$spkg_all"
+            "/usr/local/lib/node_modules/$spkg_all"
+            "/usr/lib/node_modules/$spkg_all"
+        )
+        
+        local old_nullglob=$(shopt -p nullglob || true)
+        shopt -s nullglob
+        for dir_pattern in "${search_dirs[@]}"; do
+            for dir in $dir_pattern; do
+                if [[ -d "$dir" && -f "$dir/package.json" ]]; then
+                    local ver
+                    ver=$(grep '"version"' "$dir/package.json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+                    results+=("$dir|$ver")
+                fi
+            done
+        done
+        eval "$old_nullglob" 2>/dev/null || true
+    done
+    
+    # 也通过包管理器查询（同时搜新旧包名）
+    for spkg_all in "${search_pkgs_all[@]}"; do
+        if command -v npm &>/dev/null; then
+            local npm_path=$(npm list -g "$spkg_all" --parseable 2>/dev/null | head -1)
+            if [[ -n "$npm_path" && -f "$npm_path/package.json" ]]; then
+                local already=false
+                for r in "${results[@]}"; do
+                    [[ "${r%%|*}" == "$npm_path" ]] && already=true && break
+                done
+                if [[ "$already" == false ]]; then
+                    local ver=$(grep '"version"' "$npm_path/package.json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+                    results+=("$npm_path|$ver")
+                fi
+            fi
+        fi
+    done
+    
+    # --- v1.6.0: 扫描 OpenCode 插件缓存目录 ---
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        local cache_dir; cache_dir=$(_cache_path)
+        if [[ -n "$cache_dir" && -d "$cache_dir/node_modules" ]]; then
+            for cache_pkg in "$OMO_PKG_NEW" "$OMO_PKG_OLD"; do
+                local cache_pkg_json="$cache_dir/node_modules/$cache_pkg/package.json"
+                if [[ -f "$cache_pkg_json" ]]; then
+                    local already=false
+                    for r in "${results[@]}"; do
+                        [[ "${r%%|*}" == "$(dirname "$cache_pkg_json")" ]] && already=true && break
+                    done
+                    if [[ "$already" == false ]]; then
+                        local cver
+                        cver=$(grep '"version"' "$cache_pkg_json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+                        results+=("$(dirname "$cache_pkg_json")|$cver")
+                    fi
+                fi
+            done
+        fi
+    fi
+    
+    echo "${results[@]}"
 }
 
 # 获取包管理器的全局根目录
@@ -624,7 +1156,7 @@ get_local_version() {
     local nvm_current_bin=""
     local fnm_current_bin=""
     if [[ -d "$NVM_DIR/versions/node" ]]; then
-        nvm_current_bin="$(ls -d $NVM_DIR/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
+        nvm_current_bin="$(ls -t $NVM_DIR/versions/node/*/bin 2>/dev/null | head -1)"
     fi
     # fnm 支持
     if command -v fnm &>/dev/null; then
@@ -632,22 +1164,33 @@ get_local_version() {
     elif [[ -d "$HOME/.fnm" ]]; then
         fnm_current_bin="$HOME/.fnm/node-versions/$(ls -t $HOME/.fnm/node-versions/ 2>/dev/null | head -1)/bin"
     fi
-    local search_paths=(
-        # 优先搜OMO
-        "$npm_global_bin/oh-my-opencode"
-        "$nvm_current_bin/oh-my-opencode"
-        "$fnm_current_bin/oh-my-opencode"
-        "$HOME/.local/lib/node_modules/oh-my-opencode/bin/oh-my-opencode"
-        "$HOME/.bun/bin/oh-my-opencode"
-        "$HOME/.local/share/pnpm/oh-my-opencode"
-        # 再搜OpenCode
-        "$npm_global_bin/opencode"
-        "$nvm_current_bin/opencode"
-        "$fnm_current_bin/opencode"
-        "$HOME/.local/lib/node_modules/opencode/bin/opencode"
-        "$HOME/.bun/bin/opencode"
-        "$HOME/.local/share/pnpm/opencode"
-    )
+    # 根据搜索目标分离路径，防止OC搜索时误认OMO（或反之）
+    local search_paths=()
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        search_paths=(
+            "$npm_global_bin/oh-my-openagent"
+            "$npm_global_bin/oh-my-opencode"
+            "$nvm_current_bin/oh-my-openagent"
+            "$nvm_current_bin/oh-my-opencode"
+            "$fnm_current_bin/oh-my-openagent"
+            "$fnm_current_bin/oh-my-opencode"
+            "$HOME/.local/lib/node_modules/oh-my-openagent/bin/oh-my-opencode"
+            "$HOME/.local/lib/node_modules/oh-my-opencode/bin/oh-my-opencode"
+            "$HOME/.bun/bin/oh-my-openagent"
+            "$HOME/.bun/bin/oh-my-opencode"
+            "$HOME/.local/share/pnpm/oh-my-openagent"
+            "$HOME/.local/share/pnpm/oh-my-opencode"
+        )
+    else
+        search_paths=(
+            "$npm_global_bin/opencode"
+            "$nvm_current_bin/opencode"
+            "$fnm_current_bin/opencode"
+            "$HOME/.local/lib/node_modules/opencode/bin/opencode"
+            "$HOME/.bun/bin/opencode"
+            "$HOME/.local/share/pnpm/opencode"
+        )
+    fi
     
     for search_path in "${search_paths[@]}"; do
         if [[ -x "$search_path" ]]; then
@@ -671,7 +1214,7 @@ get_local_version() {
     local nvm_current_root=""
     local fnm_current_root=""
     if [[ -d "$NVM_DIR/versions/node" ]]; then
-        nvm_current_root="$(ls -d $NVM_DIR/versions/node/*/lib/node_modules 2>/dev/null | sort -V | tail -1)"
+        nvm_current_root="$(ls -t $NVM_DIR/versions/node/*/lib/node_modules 2>/dev/null | head -1)"
     fi
     # fnm 支持
     if command -v fnm &>/dev/null; then
@@ -679,31 +1222,67 @@ get_local_version() {
     elif [[ -d "$HOME/.fnm/node-versions" ]]; then
         fnm_current_root="$HOME/.fnm/node-versions/$(ls -t $HOME/.fnm/node-versions/ 2>/dev/null | head -1)/lib/node_modules"
     fi
-    local pkg_paths=(
-        "$npm_root/$pkg/package.json"
-        "$nvm_current_root/$pkg/package.json"
-        "$fnm_current_root/$pkg/package.json"
-        "$HOME/.local/lib/node_modules/$pkg/package.json"
-        "$HOME/.bun/install/global/node_modules/$pkg/package.json"
-        "$HOME/.local/share/pnpm/global/5/node_modules/$pkg/package.json"
-    )
-    
-    for pkg_json in "${pkg_paths[@]}"; do
-        if [[ -f "$pkg_json" ]]; then
-            local pkg_version=$(grep '"version"' "$pkg_json" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
-            if [[ -n "$pkg_version" && "$pkg_version" != "null" ]]; then
-                # 缓存路径用于提示
-                if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
-                    export OMO_PKG_FOUND="$pkg_json"
-                else
-                    export OC_PKG_FOUND="$pkg_json"
+    # 构建搜索路径（对OMO同时搜新旧两个包名）
+    local pkgs_to_search=("$pkg")
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        [[ "$pkg" == "$OMO_PKG_OLD" ]] && pkgs_to_search+=("$OMO_PKG_NEW") || pkgs_to_search+=("$OMO_PKG_OLD")
+    fi
+    local found_broken_dir=""   # 记录无package.json的目录（broken install）
+    local sp
+    for sp in "${pkgs_to_search[@]}"; do
+        local _config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
+        local pkg_paths=(
+            "$npm_root/$sp/package.json"
+            "$nvm_current_root/$sp/package.json"
+            "$fnm_current_root/$sp/package.json"
+            "$HOME/.local/lib/node_modules/$sp/package.json"
+            "$HOME/.bun/install/global/node_modules/$sp/package.json"
+            "$HOME/.local/share/pnpm/global/5/node_modules/$sp/package.json"
+            "$_config_dir/opencode/node_modules/$sp/package.json"
+        )
+        for pkg_json in "${pkg_paths[@]}"; do
+            if [[ -f "$pkg_json" ]]; then
+                local pkg_version=$(grep '"version"' "$pkg_json" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+                if [[ -n "$pkg_version" && "$pkg_version" != "null" ]]; then
+                    # 缓存路径用于提示
+                    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+                        export OMO_PKG_FOUND="$pkg_json"
+                    else
+                        export OC_PKG_FOUND="$pkg_json"
+                    fi
+                    echo "$pkg_version"
+                    return
                 fi
-                echo "$pkg_version"
-                return
             fi
-        fi
+            # 记录目录存在但无package.json的情况（broken install）
+            local pkg_dir
+            pkg_dir=$(dirname "$pkg_json" 2>/dev/null)
+            if [[ -d "$pkg_dir" ]] && [[ -z "$found_broken_dir" ]]; then
+                found_broken_dir="$pkg_dir"
+            fi
+        done
     done
     
+    # 四级检测：包目录存在但无package.json（broken install）
+    if [[ -n "$found_broken_dir" ]]; then
+        # 标记为broken，让调用方知道安装存在但异常
+        if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+            export OMO_PKG_FOUND_BROKEN="$found_broken_dir"
+        fi
+        echo "broken"
+        return
+    fi
+    
+    # 五级检测：检查 OMO 是否作为 OpenCode 插件注册（OMO v4.6.0+）
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        local _plugin_path; _plugin_path=$(_detect_omo_plugin)
+        if [[ -n "$_plugin_path" ]]; then
+            export OMO_PLUGIN_REGISTERED=1
+            echo "plugin-configured"
+            return
+        fi
+    fi
+
     # 所有检测都失败，返回未安装
     echo "not-installed"
 }
@@ -748,28 +1327,41 @@ get_remote_version() {
         fi
     fi
     
-    # 第四步：如果本地有npm，尝试用npm view命令获取
+    # 第四步：如果本地有npm，尝试用npm view命令获取（带registry fallback）
     if command -v npm &>/dev/null; then
         log_debug "尝试通过npm获取版本..."
-        # npm参数：15秒超时，不输出多余日志
-        local npm_args="--fetch-timeout=15000 --no-audit --no-fund $([ -n "$NPM_REGISTRY" ] && echo "--registry=$NPM_REGISTRY")"
-        version=$(run_with_retry --retries 2 --timeout 20 npm view "$pkg" version $npm_args 2>/dev/null)
-        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            log_debug "npm获取版本成功：v$version"
-            echo "$version"
-            return 0
-        fi
+        # 构建 registry 列表（去重）
+        local npm_registries=("$NPM_REGISTRY")
+        for r in "${NPM_REGISTRIES[@]}"; do
+            local skip=false
+            for s in "${npm_registries[@]}"; do [[ "$s" == "$r" ]] && skip=true && break; done
+            [[ "$skip" == false ]] && npm_registries+=("$r")
+        done
+        local has_official=false
+        for r in "${npm_registries[@]}"; do [[ "$r" == "https://registry.npmjs.org" ]] && has_official=true && break; done
+        [[ "$has_official" == false ]] && npm_registries+=("https://registry.npmjs.org")
         
-        # OMO特殊处理：尝试另一个包名
-        if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
-            local other_pkg=$([ "$pkg" == "$OMO_PKG_OLD" ] && echo "$OMO_PKG_NEW" || echo "$OMO_PKG_OLD")
-            version=$(run_with_retry --retries 2 --timeout 20 npm view "$other_pkg" version $npm_args 2>/dev/null)
+        # 遍历 registry 列表
+        for reg in "${npm_registries[@]}"; do
+            local npm_args="--fetch-timeout=15000 --no-audit --no-fund --registry=$reg"
+            version=$(run_with_retry --retries 1 --timeout 15 npm view "$pkg" version $npm_args 2>/dev/null)
             if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                log_debug "npm获取OMO备用包名版本成功：v$version"
+                log_debug "npm ($reg) 获取版本成功：v$version"
                 echo "$version"
                 return 0
             fi
-        fi
+            
+            # OMO特殊处理：尝试另一个包名
+            if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+                local other_pkg=$([ "$pkg" == "$OMO_PKG_OLD" ] && echo "$OMO_PKG_NEW" || echo "$OMO_PKG_OLD")
+                version=$(run_with_retry --retries 1 --timeout 15 npm view "$other_pkg" version $npm_args 2>/dev/null)
+                if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    log_debug "npm ($reg) 获取OMO备用包名版本成功：v$version"
+                    echo "$version"
+                    return 0
+                fi
+            fi
+        done
     fi
     
     # 所有方法都失败
@@ -800,13 +1392,16 @@ needs_update() {
     local local_ver="$1" remote_ver="$2"
     # 远程版本获取失败时，返回2表示无法确定，避免误报和误导
     [[ "$remote_ver" == "unknown" ]] && return 2
-    # 本地未安装，肯定需要更新
-    [[ "$local_ver" == "not-installed" ]] && return 0
+    # 本地未安装、broken install、或仅配置为插件未下载，肯定需要更新
+    [[ "$local_ver" == "not-installed" || "$local_ver" == "broken" || "$local_ver" == "plugin-configured" ]] && return 0
     # 去掉本地版本号前缀的v
     local_ver="${local_ver#v}"
-    # 语义化版本比较：使用sort -V判断remote_ver是否大于local_ver
-    local higher_ver=$(printf "%s\n%s" "$local_ver" "$remote_ver" | sort -V | tail -n1)
-    [[ "$higher_ver" != "$local_ver" ]] && return 0 || return 1
+    # 语义化版本比较：使用纯bash函数判断remote_ver是否大于local_ver
+    if version_gt "$remote_ver" "$local_ver"; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 get_changelog() {
@@ -910,7 +1505,6 @@ get_changelog() {
 
 update_package() {
     local pkg="$1" name="$2" expected_ver="$3"
-    echo -e "${CYAN}正在更新 $name 到 $expected_ver...${NC}"
     
     # 尝试加载nvm环境（解决非交互式shell下nvm不自动加载的问题）
     load_nvm() {
@@ -946,8 +1540,8 @@ update_package() {
         log_debug "未找到nvm环境或加载失败"
         return 1
     }
-    # 先尝试加载nvm环境
-    load_nvm
+    # 先尝试加载nvm环境（失败不中断流程）
+    load_nvm || true
     
     # 检测包管理器
     local pm
@@ -956,66 +1550,245 @@ update_package() {
     
     # 查找当前安装路径
     local pkg_path
-    pkg_path=$(find_package_path "$pkg")
+    pkg_path=$(_safe_capture find_package_path "$pkg")
     
-    local install_cmd=""
+    # 根据安装状态显示不同消息
+    if [[ -n "$pkg_path" ]]; then
+        if [[ "${OMO_PLUGIN_REGISTERED:-0}" == "1" ]]; then
+            echo -e "${CYAN}$name 已注册为 OpenCode 插件，正在下载安装到 $expected_ver...${NC}"
+        else
+            echo -e "${CYAN}正在更新 $name 到 $expected_ver...${NC}"
+        fi
+    else
+        echo -e "${CYAN}正在安装 $name $expected_ver...${NC}"
+    fi
+    
     local success=true
+    
+    # --- OMO 必须用 bunx 官方安装器（升级也是安装） ---
+    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+        echo -e "  ${BLUE}OMO 使用官方安装器: bunx oh-my-openagent install${NC}"
+        echo -e "  ${BLUE}(OMO 是 OpenCode 插件，必须通过官方安装器升级)${NC}"
+
+        # 构建包名 spec（支持版本锁定）
+        local omo_pkg_spec="oh-my-openagent"
+        if [[ -n "$expected_ver" && "$expected_ver" =~ ^[0-9] ]]; then
+            omo_pkg_spec="oh-my-openagent@${expected_ver}"
+        fi
+
+        # 构建 registry fallback 列表
+        local b_registries=()
+        local b_seen=""
+        for r in "$NPM_REGISTRY" "${NPM_REGISTRIES[@]}"; do
+            local b_skip=false
+            for s in "${b_registries[@]}"; do
+                [[ "$s" == "$r" ]] && b_skip=true && break
+            done
+            [[ "$b_skip" == false ]] && b_registries+=("$r")
+        done
+        if ! printf '%s\n' "${b_registries[@]}" | grep -qx 'https://registry.npmjs.org'; then
+            b_registries+=("https://registry.npmjs.org")
+        fi
+
+        local omo_install_ok=false
+
+        # OMO v4.6.0+ 硬依赖 bun，先确保可用
+        _ensure_bun || return 1
+
+        # 确保 opencode 命令在 PATH 中（OMO 安装器需要检测 opencode）
+        if ! command -v opencode &>/dev/null; then
+            local _oc_bin; _oc_bin=$(npm prefix -g 2>/dev/null)/bin
+            if [[ -x "$_oc_bin/opencode" ]]; then
+                export PATH="$_oc_bin:$PATH"
+                echo -e "  ${BLUE}已将 opencode 所在目录加入 PATH: $_oc_bin${NC}"
+            fi
+        fi
+
+        # --- 策略：用 bun add -g + 手动 postinstall 替代 bunx（bunx 隔离全局 node_modules，
+        #     导致平台二进制在 arm64/musl 等平台上找不到） ---
+        echo -e "  ${BLUE}通过 bun add -g 安装 OMO...${NC}"
+        local _omo_add_ok=false
+        for registry in "${b_registries[@]}"; do
+            echo -e "    registry: ${registry}"
+            # 先清缓存确保重新下载
+            rm -rf "$HOME/.bun/install/cache/oh-my-openagent"* "$HOME/.bun/install/cache/oh-my-opencode"* 2>/dev/null || true
+            # 安装主包（bun add -g 会自动解析并安装平台二进制 optionalDependency）
+            if BUN_CONFIG_REGISTRY="$registry" bun add -g "$omo_pkg_spec" 2>&1; then
+                _omo_add_ok=true
+                echo -e "  ${GREEN}✓ bun add -g 安装成功${NC}"
+                break
+            fi
+            echo -e "    ${YELLOW}失败，尝试下一个 registry...${NC}"
+        done
+
+        if [[ "$_omo_add_ok" == true ]]; then
+            # 信任并运行 postinstall（默认被 bun 阻止）
+            echo -e "  ${BLUE}信任并运行 postinstall...${NC}"
+            bun pm -g trust oh-my-openagent 2>/dev/null || true
+            # 手动运行 postinstall
+            local _omo_global_dir="$HOME/.bun/install/global/node_modules/oh-my-openagent"
+            if [[ -d "$_omo_global_dir" ]]; then
+                pushd "$_omo_global_dir" >/dev/null 2>&1 || true
+                if node postinstall.mjs 2>&1; then
+                    echo -e "  ${GREEN}✓ postinstall 完成${NC}"
+                else
+                    echo -e "  ${YELLOW}⚠ postinstall 有警告${NC}"
+                fi
+                popd >/dev/null 2>&1 || true
+            fi
+            omo_install_ok=true
+        else
+            # 兜底：尝试 bunx（部分平台 bunx 可用）
+            echo -e "  ${YELLOW}bun add -g 失败，尝试 bunx 方式...${NC}"
+            for registry in "${b_registries[@]}"; do
+                export BUN_CONFIG_REGISTRY="$registry"
+                if bunx --bun "$omo_pkg_spec" install --no-tui --skip-auth --claude=no --gemini=no --copilot=no 2>&1; then
+                    omo_install_ok=true
+                    break
+                fi
+                echo -e "  ${YELLOW}  镜像 $registry 失败，尝试下一个...${NC}"
+                rm -rf "$HOME/.bun/install/cache/oh-my-openagent"* "$HOME/.bun/install/cache/oh-my-opencode"* 2>/dev/null || true
+            done
+        fi
+
+        if [[ "$omo_install_ok" == true ]]; then
+            echo -e "${GREEN}✓ Oh-My-OpenCode 升级成功${NC}"
+            _cache_clean_old_pkg
+            _ensure_omo_symlink
+            # 清理全局残留的旧包名 broken install（无package.json）
+            local _npm_root; _npm_root=$(npm root -g 2>/dev/null)
+            if [[ -n "$_npm_root" && -d "$_npm_root/$OMO_PKG_OLD" && ! -f "$_npm_root/$OMO_PKG_OLD/package.json" ]]; then
+                echo -e "  ${YELLOW}检测到残留的旧包名 $OMO_PKG_OLD（broken install），正在清理...${NC}"
+                if npm uninstall -g "$OMO_PKG_OLD" 2>/dev/null; then
+                    echo -e "  ${GREEN}✓ 已清理全局残留 $OMO_PKG_OLD${NC}"
+                else
+                    echo -e "  ${YELLOW}⚠ npm 卸载失败（broken install 无 package.json），直接删除目录...${NC}"
+                    rm -rf "$_npm_root/$OMO_PKG_OLD" 2>/dev/null && \
+                        echo -e "  ${GREEN}✓ 已删除残留目录 $_npm_root/$OMO_PKG_OLD${NC}" || \
+                        echo -e "  ${YELLOW}⚠ 自动清理失败，可手动执行: rm -rf $_npm_root/$OMO_PKG_OLD${NC}"
+                fi
+            fi
+            return 0
+        else
+            echo -e "${RED}✗ Oh-My-OpenCode 升级失败${NC}"
+            return 1
+        fi
+    fi
+
+    # --- Yarn Berry (v2+) 检测并优雅跳过 ---
+    if [[ "$pm" == "yarn" ]] && command -v yarn &>/dev/null; then
+        local yarn_major
+        yarn_major=$(yarn --version 2>/dev/null | cut -d. -f1)
+        if [[ -n "$yarn_major" && "$yarn_major" -ge 2 ]]; then
+            echo -e "  ${YELLOW}⚠ Yarn v${yarn_major} (Berry) 不支持 global install 命令${NC}"
+            echo -e "  ${YELLOW}  请使用 npm/pnpm/bun 安装，或通过 corepack 切换为 Yarn Classic${NC}"
+            success=false
+            return 1
+        fi
+    fi
+    
+    # --- 构建安装命令数组 ---
+    local install_cmd=()
     
     case "$pm" in
         pnpm)
             if [[ -n "$pkg_path" ]]; then
-                # pnpm 全局更新
-                install_cmd="pnpm update -g $pkg"
+                install_cmd=(pnpm update -g "$pkg")
             else
-                install_cmd="pnpm add -g $pkg"
+                install_cmd=(pnpm add -g "$pkg")
             fi
             ;;
         yarn)
-            install_cmd="yarn global add $pkg"
+            install_cmd=(yarn global add "$pkg")
             ;;
         bun)
-            install_cmd="bun add -g $pkg"
+            install_cmd=(bun add -g "$pkg")
             ;;
         npm|*)
-            # npm: 需要确定安装位置
             if [[ -n "$pkg_path" ]]; then
-                # 从包路径提取安装根目录
                 local install_root
                 install_root=$(dirname "$pkg_path")
                 
-                # 检查是否是 ~/.local 或其他需要 --prefix 的位置
                 if [[ "$install_root" == "$HOME/.local/lib/node_modules" ]]; then
-                    install_cmd="npm install --prefix $HOME/.local -g $pkg"
+                    install_cmd=(npm install --prefix "$HOME/.local" -g "$pkg")
                 elif [[ "$install_root" == *"/.bun/"* ]]; then
-                    # bun 管理的，用 bun 更新
-                    install_cmd="bun update -g $pkg"
+                    install_cmd=(bun update -g "$pkg")
                     pm="bun"
                 else
-                    # NVM 或系统级，直接 npm install -g
-                    install_cmd="npm install -g $pkg"
+                    install_cmd=(npm install -g "$pkg")
                 fi
             else
-                # 未安装，使用默认全局安装
-                install_cmd="npm install -g $pkg"
+                install_cmd=(npm install -g "$pkg")
             fi
             ;;
     esac
     
+    # --- 应用版本后缀（pkg → pkg@ver） ---
+    local pkg_ver_suffix=""
+    if [[ -n "$expected_ver" && "$expected_ver" =~ ^[0-9] ]]; then
+        pkg_ver_suffix="@${expected_ver}"
+    fi
+    local pkg_idx=-1
+    for idx in "${!install_cmd[@]}"; do
+        if [[ "${install_cmd[$idx]}" == "$pkg" ]]; then
+            pkg_idx=$idx
+            install_cmd[$idx]="${pkg}${pkg_ver_suffix}"
+            break
+        fi
+    done
+    
+    # --- 构建 registry fallback 列表 ---
+    # 先尝试用户指定的 NPM_REGISTRY，再尝试内置备用列表，最后兜底官方源
+    local registries=()
+    local seen_reg=""
+    for r in "$NPM_REGISTRY" "${NPM_REGISTRIES[@]}"; do
+        # 去重
+        local skip=false
+        for s in "${registries[@]}"; do
+            [[ "$s" == "$r" ]] && skip=true && break
+        done
+        [[ "$skip" == false ]] && registries+=("$r")
+    done
+    # 确保官方源兜底
+    local has_official=false
+    for r in "${registries[@]}"; do
+        [[ "$r" == "https://registry.npmjs.org" ]] && has_official=true && break
+    done
+    [[ "$has_official" == false ]] && registries+=("https://registry.npmjs.org")
+    
+    # --- 执行安装（带 OMO 双包名 + registry fallback） ---
     local install_success=false
     local attempt_pkg="$pkg"
     local max_attempts=1
-    # OMO双包名重试机制：自动尝试新旧两个包名，保证更新成功率
     if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
         max_attempts=2
     fi
     
     for ((attempt=0; attempt<max_attempts; attempt++)); do
-        echo -e "  ${BLUE}执行: $install_cmd${NC}"
-        if eval "$install_cmd" 2>&1; then
-            install_success=true
-            break
-        elif [[ $attempt -eq 0 && $max_attempts -eq 2 ]]; then
-            # 第一次失败，切换到备用包名重试
+        # 尝试各个 registry
+        for registry in "${registries[@]}"; do
+            local exec_cmd=("${install_cmd[@]}")
+            
+            # npm/pnpm/yarn 注入 --registry；bun 用环境变量
+            if [[ "$pm" == "bun" ]]; then
+                export BUN_CONFIG_REGISTRY="$registry"
+            else
+                exec_cmd+=(--registry="$registry")
+            fi
+            
+            # 显示执行命令（清洗 registry URL 避免日志泄露敏感信息）
+            local display_cmd="${exec_cmd[*]//--registry=*/--registry=***}"
+            echo -e "  ${BLUE}执行: $display_cmd${NC}"
+            
+            if "${exec_cmd[@]}" 2>&1; then
+                install_success=true
+                break 2  # 跳出双重循环
+            fi
+            echo -e "  ${YELLOW}  镜像 $registry 失败，尝试下一个...${NC}"
+        done
+        
+        if [[ "$install_success" == false && $attempt -eq 0 && $max_attempts -eq 2 ]]; then
+            # OMO 第一轮所有 registry 失败，切包名重试
             local other_pkg
             if [[ "$attempt_pkg" == "$OMO_PKG_OLD" ]]; then
                 other_pkg="$OMO_PKG_NEW"
@@ -1023,16 +1796,22 @@ update_package() {
                 other_pkg="$OMO_PKG_OLD"
             fi
             echo -e "${YELLOW}  包名 $attempt_pkg 安装失败，自动尝试备用包名 $other_pkg${NC}"
-            # 替换install_cmd中的包名
-            install_cmd=${install_cmd//$attempt_pkg/$other_pkg}
+            # 替换数组中的包名元素
+            if [[ $pkg_idx -ge 0 ]]; then
+                install_cmd[$pkg_idx]="${other_pkg}${pkg_ver_suffix}"
+            fi
             attempt_pkg="$other_pkg"
-            pkg="$other_pkg" # 更新pkg变量用于后续校验
+            pkg="$other_pkg"
         fi
     done
     
     if [[ "$install_success" == true ]]; then
         # 验证更新
         sleep 1  # 等待文件系统同步
+        
+        # 清除bash命令缓存，确保下次调用使用新版本
+        hash -r 2>/dev/null || true
+        
         local actual_ver
         if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
             # OMO优先用omo命令直接获取版本，更准确
@@ -1049,51 +1828,89 @@ update_package() {
             echo -e "  可能需要重新登录或运行 'hash -r' 刷新 PATH 缓存"
             success=false
         fi
+        
+        # 重验证：检查 command -v 是否真的解析到更新后的路径
+        local cmd_to_check=""
+        if [[ "$pkg" == "opencode-ai" ]]; then
+            cmd_to_check="opencode"
+        elif [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]]; then
+            cmd_to_check="omo"
+        fi
+        if [[ -n "$cmd_to_check" ]]; then
+            local resolved_path
+            resolved_path=$(command -v "$cmd_to_check" 2>/dev/null || true)
+            if [[ -n "$resolved_path" ]]; then
+                if [[ -L "$resolved_path" ]]; then
+                    resolved_path=$(readlink -f "$resolved_path" 2>/dev/null || readlink "$resolved_path")
+                fi
+                # 检查是否指向新安装的路径
+                local pkg_dir_after
+                if [[ "$resolved_path" == */bin/* ]]; then
+                    pkg_dir_after=$(dirname "$(dirname "$resolved_path")")
+                    if [[ -f "$pkg_dir_after/package.json" && "$pkg_dir_after" != "$(find_package_path "$pkg")" ]]; then
+                        echo -e "  ${YELLOW}⚠ shell解析的 $cmd_to_check 路径($pkg_dir_after) 与更新的安装路径不一致${NC}"
+                        echo -e "  ${YELLOW}  可能需要调整 PATH 顺序或运行 'hash -r'${NC}"
+                    fi
+                fi
+            fi
+        fi
+        
+        # 扫描其他安装路径，检测 PATH 遮蔽
+        if [[ -n "$cmd_to_check" ]]; then
+            _check_stale_shadowing "$pkg" "$cmd_to_check" || true
+        fi
     else
         echo -e "${RED}✗ $name 更新失败${NC}"
         return 1
     fi
     
-    # 显示实际使用的 opencode 路径
-    if [[ "$pkg" == "opencode-ai" ]]; then
-        local actual_path
-        actual_path=$(command -v opencode 2>/dev/null)
-        if [[ -n "$actual_path" ]]; then
-            echo -e "  ${BLUE}当前 opencode 路径: $actual_path${NC}"
+    # 确保 PM 全局 bin 目录中有正确的命令软链接
+    if [[ "$success" == true ]]; then
+        # 重新查找安装路径（首次安装后 pkg_path 可能为空，需要重新获取）
+        local sl_pkg_path="$pkg_path"
+        if [[ -z "$sl_pkg_path" ]]; then
+            sl_pkg_path=$(_safe_capture find_package_path "$pkg")
         fi
-    fi
-    
-    # 对于Oh-My-OpenCode，自动创建omo软链接（无需用户修改环境）
-    if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && [[ "$success" == true ]]; then
-        local omo_pkg_path
-        omo_pkg_path=$(find_package_path "$OMO_PKG")
-        if [[ -n "$omo_pkg_path" && -f "$omo_pkg_path/bin/oh-my-opencode.js" ]]; then
-            # 找到当前包管理器的全局bin目录
-            local bin_dir=""
-            case "$pm" in
-                pnpm)
-                    bin_dir="$PNPM_HOME"
-                    ;;
-                npm)
-                    bin_dir=$(npm config get prefix 2>/dev/null | sed 's/$/\/bin/')
-                    ;;
-                yarn)
-                    bin_dir=$(yarn global bin 2>/dev/null)
-                    ;;
-                bun)
-                    bin_dir="$HOME/.bun/bin"
-                    ;;
-            esac
+        
+        local bin_dir=""
+        case "$pm" in
+            pnpm) bin_dir="$PNPM_HOME" ;;
+            npm) bin_dir=$(npm config get prefix 2>/dev/null | sed 's/$/\/bin/') ;;
+            yarn) bin_dir=$(yarn global bin 2>/dev/null) ;;
+            bun) bin_dir="$HOME/.bun/bin" ;;
+        esac
+        
+        if [[ -n "$bin_dir" && -d "$bin_dir" && -n "$sl_pkg_path" ]]; then
+            if [[ "$pkg" == "opencode-ai" ]] && [[ -f "$sl_pkg_path/bin/opencode" || -f "$sl_pkg_path/bin/opencode.js" ]]; then
+                local opencode_bin
+                opencode_bin="$sl_pkg_path/bin/opencode"
+                [[ ! -f "$opencode_bin" ]] && opencode_bin="$sl_pkg_path/bin/opencode.js"
+                if [[ -f "$opencode_bin" ]]; then
+                    # 只修复当 command -v 解析到不同路径时
+                    local current_cmd; current_cmd=$(command -v opencode 2>/dev/null || true)
+                    if [[ -L "$current_cmd" && "$(readlink -f "$current_cmd" 2>/dev/null)" != "$(readlink -f "$opencode_bin" 2>/dev/null)" ]] || \
+                       [[ -f "$current_cmd" && "$(dirname "$(dirname "$current_cmd")")" != "$sl_pkg_path" ]]; then
+                        ln -sf "$opencode_bin" "$bin_dir/opencode" 2>/dev/null || true
+                        echo -e "  ${BLUE}已更新 opencode 命令软链接到 $bin_dir${NC}"
+                    fi
+                fi
+            fi
             
-            # 创建软链接
-            if [[ -n "$bin_dir" && -d "$bin_dir" ]]; then
-                ln -sf "$omo_pkg_path/bin/oh-my-opencode.js" "$bin_dir/oh-my-opencode"
-                ln -sf "$bin_dir/oh-my-opencode" "$bin_dir/omo"
-                chmod +x "$bin_dir/oh-my-opencode"
-                echo -e "  ${BLUE}已自动创建 omo 命令软链接到 $bin_dir${NC}"
+            # 对于Oh-My-OpenCode，自动创建omo软链接（无需用户修改环境）
+            if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && [[ -d "$sl_pkg_path/bin" ]]; then
+                local omo_js=""
+                [[ -f "$sl_pkg_path/bin/oh-my-opencode.js" ]] && omo_js="$sl_pkg_path/bin/oh-my-opencode.js"
+                [[ -f "$sl_pkg_path/bin/oh-my-opencode" ]] && omo_js="$sl_pkg_path/bin/oh-my-opencode"
+                if [[ -n "$omo_js" ]]; then
+                    ln -sf "$omo_js" "$bin_dir/oh-my-opencode" 2>/dev/null || true
+                    ln -sf "$bin_dir/oh-my-opencode" "$bin_dir/omo" 2>/dev/null || true
+                    chmod +x "$omo_js" 2>/dev/null || true
+                    echo -e "  ${BLUE}已自动创建 omo 命令软链接到 $bin_dir${NC}"
+                fi
             fi
         fi
     fi
+
     
     [[ "$success" == true ]]
 }
@@ -1102,15 +1919,23 @@ update_package() {
 # Commands
 # ============================================
 
+# 安全捕获函数输出到变量，抑制 set -e 退出
+# 用法: var=$(_safe_capture func arg1 arg2)
+# 等价于 var=$(func arg1 arg2 || true)
+# 解决 bash set -e 下 local var=$(func) 因 func 返回非零导致脚本退出的问题
+_safe_capture() {
+    "$@" || true
+}
+
 show_config() {
     echo ""
     echo -e "${BOLD}当前配置${NC}"
     echo "─────────────────────────────────────"
     
     # OpenCode
-    local oc_auto; oc_auto=$(get_oc_autoupdate)
-    local oc_path; oc_path=$(find_package_path "$OC_PKG")
-    local oc_pm; oc_pm=$(detect_package_manager "$OC_PKG")
+    local oc_auto; oc_auto=$(_safe_capture get_oc_autoupdate)
+    local oc_path; oc_path=$(_safe_capture find_package_path "$OC_PKG")
+    local oc_pm; oc_pm=$(_safe_capture detect_package_manager "$OC_PKG")
     
     echo -e "${BOLD}OpenCode:${NC}"
     case "$oc_auto" in
@@ -1130,9 +1955,9 @@ show_config() {
     echo ""
     
     # Oh-My-OpenCode
-    local omo_auto; omo_auto=$(get_omo_auto_update)
-    local omo_path; omo_path=$(find_package_path "$OMO_PKG")
-    local omo_pm; omo_pm=$(detect_package_manager "$OMO_PKG")
+    local omo_auto; omo_auto=$(_safe_capture get_omo_auto_update)
+    local omo_path; omo_path=$(_safe_capture find_package_path "$OMO_PKG")
+    local omo_pm; omo_pm=$(_safe_capture detect_package_manager "$OMO_PKG")
     
     echo -e "${BOLD}Oh-My-OpenCode:${NC}"
     case "$omo_auto" in
@@ -1142,7 +1967,16 @@ show_config() {
     esac
     echo -e "  包管理器: ${CYAN}$omo_pm${NC}"
     if [[ -n "$omo_path" ]]; then
-        echo -e "  安装路径: ${CYAN}$omo_path${NC}"
+        if [[ "${OMO_PLUGIN_REGISTERED:-0}" == "1" ]]; then
+            echo -e "  安装方式: ${BLUE}OpenCode 插件${NC}"
+            echo -e "  配置文件: ${CYAN}$omo_path${NC}"
+            echo -e "  状态: ${YELLOW}已注册（需启动 OpenCode 完成下载安装）${NC}"
+        else
+            echo -e "  安装路径: ${CYAN}$omo_path${NC}"
+            if [[ ! -f "$omo_path/package.json" ]]; then
+                echo -e "  ${YELLOW}⚠ 安装异常：package.json 缺失（broken install）${NC}"
+            fi
+        fi
     else
         echo -e "  安装路径: ${YELLOW}未检测到${NC}"
     fi
@@ -1152,9 +1986,56 @@ show_config() {
         echo -e "  disabled_hooks: ${GREEN}不包含 \"auto-update-checker\"${NC}"
     fi
     echo ""
+    
+    # 检测是否存在多个安装版本（常见于npm+pnpm混合安装）
+    echo -e "${BOLD}多版本扫描:${NC}"
+    local multi_found=false
+    if [[ -n "$oc_path" ]]; then
+        _check_stale_shadowing "$OC_PKG" "opencode" || multi_found=true
+    fi
+    if [[ -n "$omo_path" ]]; then
+        _check_stale_shadowing "$OMO_PKG" "omo" || multi_found=true
+    fi
+    if [[ "$multi_found" == false ]]; then
+        echo -e "  未发现多余版本"
+    fi
+    echo ""
+    echo ""
+    
+    # --- v1.6.0: 缓存一致性检查 ---
+    echo -e "${BOLD}OpenCode 缓存检查:${NC}"
+    local cache_dir; cache_dir=$(_safe_capture _cache_path)
+    if [[ -z "$cache_dir" || ! -d "$cache_dir" ]]; then
+        echo -e "  缓存目录不存在: ${YELLOW}$cache_dir${NC}"
+        echo -e "  (OpenCode 未运行过或尚未创建缓存)"
+    else
+        local cache_omo_ver; cache_omo_ver=$(_safe_capture _cache_omo_version)
+        case "$cache_omo_ver" in
+            no-cache)
+                echo -e "  缓存目录为空，尚未安装 OMO 插件"
+                ;;
+            not-found)
+                echo -e "  缓存中未检测到 OMO 插件"
+                ;;
+            *)
+                echo -e "  缓存 OMO 版本: ${CYAN}v$cache_omo_ver${NC}"
+                if [[ -d "$cache_dir/node_modules/$OMO_PKG_NEW" ]]; then
+                    echo -e "  包名: ${GREEN}$OMO_PKG_NEW${NC} ✓"
+                fi
+                if [[ -d "$cache_dir/node_modules/$OMO_PKG_OLD" ]]; then
+                    echo -e "  包名: ${YELLOW}$OMO_PKG_OLD (旧名! 建议清理)${NC}"
+                fi
+                _warn_cache_mismatch || true
+                ;;
+        esac
+    fi
+    echo ""
+    echo "─────────────────────────────────────"
+    echo ""
 }
 
 do_check() {
+    local target_ver="${1:-}"  # check模式下暂不使用，预留参数
     local has_update=false
     local pkgs_to_update=()
     local vers_to_update=()
@@ -1176,7 +2057,7 @@ do_check() {
         
         local local_ver remote_ver
         local_ver=$(get_local_version "$OC_PKG")
-        remote_ver=$(get_remote_version_with_retry "$OC_PKG")
+        remote_ver=$(_safe_capture get_remote_version_with_retry "$OC_PKG")
         
         # 显示版本信息
         if [[ "$remote_ver" == "unknown" ]]; then
@@ -1232,18 +2113,24 @@ do_check() {
         
         local local_ver remote_ver
         local_ver=$(get_local_version "$OMO_PKG")
-        remote_ver=$(get_remote_version_with_retry "$OMO_PKG")
-        
-        # 显示版本信息
-        if [[ "$remote_ver" == "unknown" ]]; then
+        remote_ver=$(_safe_capture get_remote_version_with_retry "$OMO_PKG")
+
+        # 显示版本信息（处理broken install / plugin-configured 特殊展示）
+        if [[ "$local_ver" == "broken" ]]; then
+            echo -e "  本地: ${RED}安装异常（broken）${NC}  远程: ${CYAN}$remote_ver${NC}"
+            echo -e "  ${YELLOW}⚠ package.json 缺失，建议清理后重新安装${NC}"
+        elif [[ "$local_ver" == "plugin-configured" ]]; then
+            echo -e "  本地: ${BLUE}已注册为插件${NC}  远程: ${CYAN}$remote_ver${NC}"
+            echo -e "  ${YELLOW}⚠ 插件已配置但未下载，需启动 OpenCode 或升级以完成安装${NC}"
+        elif [[ "$remote_ver" == "unknown" ]]; then
             echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${YELLOW}获取失败${NC}"
             export REMOTE_FETCH_FAILED=1
         else
             echo -e "  本地: ${CYAN}$local_ver${NC}  远程: ${CYAN}$remote_ver${NC}"
         fi
         
-        # 检测是否安装但不在PATH，给出友好提示
-        if [[ "$local_ver" != "not-installed" ]]; then
+        # 检测是否安装但不在PATH，给出友好提示（跳过broken install 和 plugin-configured）
+        if [[ "$local_ver" != "not-installed" && "$local_ver" != "broken" && "$local_ver" != "plugin-configured" ]]; then
             if [[ "$pkg" == "$OMO_PKG_OLD" || "$pkg" == "$OMO_PKG_NEW" ]] && [[ -n "$OMO_NOT_IN_PATH" || -n "$OMO_PKG_FOUND" ]]; then
                 echo -e "${YELLOW}  ⚠️  OMO已安装但不在当前终端PATH中${NC}"
                 echo -e "    安装路径：${BLUE}${OMO_NOT_IN_PATH:-$OMO_PKG_FOUND%/package.json/bin}${NC}"
@@ -1256,14 +2143,18 @@ do_check() {
         local update_status=0
         needs_update "$local_ver" "$remote_ver" || update_status=$?
         if [[ $update_status -eq 0 ]]; then
-            # 确定有更新
-            echo -e "${YELLOW}  🆕 有更新${NC}"
+            # 确定有更新（包括not-installed和broken）
+            if [[ "$local_ver" == "broken" ]]; then
+                echo -e "${YELLOW}  🆕 可修复安装${NC}"
+            else
+                echo -e "${YELLOW}  🆕 有更新${NC}"
+            fi
             has_update=true
             pkgs_to_update+=("$pkg")
             vers_to_update+=("$remote_ver")
             names_to_update+=("$name")
             
-            if [[ "$local_ver" != "not-installed" ]]; then
+            if [[ "$local_ver" != "not-installed" && "$local_ver" != "broken" ]]; then
                 echo ""
                 echo -e "${BOLD}  更新内容:${NC}"
                 get_changelog "$repo" | sed 's/^/    /'
@@ -1297,7 +2188,12 @@ do_check() {
         
         for i in "${!pkgs_to_update[@]}"; do
             echo -n "  更新 ${names_to_update[$i]}? [y/N] "
-            read -r answer
+            if [[ -t 0 ]]; then
+                read -r -t 30 answer || answer="n"
+            else
+                answer="n"
+                echo "  (非交互模式，跳过)"
+            fi
             if [[ "$answer" =~ ^[Yy]$ ]]; then
                 update_package "${pkgs_to_update[$i]}" "${names_to_update[$i]}" "${vers_to_update[$i]}"
             else
@@ -1309,6 +2205,8 @@ do_check() {
 }
 
 do_update() {
+    local target_ver="${1:-}"
+    
     echo ""
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BOLD}  📦 直接更新${NC}"
@@ -1316,15 +2214,908 @@ do_update() {
     echo ""
     
     if [[ "$CHECK_OC" == true ]]; then
-        local ver; ver=$(get_remote_version_with_retry "$OC_PKG")
-        update_package "$OC_PKG" "$OC_NAME" "$ver"
+        if [[ -n "$target_ver" ]]; then
+            # 用户指定了版本号，跳过远程获取
+            update_package "$OC_PKG" "$OC_NAME" "$target_ver"
+        else
+            local ver; ver=$(_safe_capture get_remote_version_with_retry "$OC_PKG")
+            update_package "$OC_PKG" "$OC_NAME" "$ver"
+        fi
     fi
     
     if [[ "$CHECK_OMO" == true ]]; then
-        local ver; ver=$(get_remote_version_with_retry "$OMO_PKG")
-        update_package "$OMO_PKG" "$OMO_NAME" "$ver"
+        if [[ -n "$target_ver" && "$CHECK_OC" == false ]]; then
+            # 仅更新OMO且指定了版本
+            update_package "$OMO_PKG" "$OMO_NAME" "$target_ver"
+        elif [[ -z "$target_ver" ]]; then
+            local ver; ver=$(_safe_capture get_remote_version_with_retry "$OMO_PKG")
+            update_package "$OMO_PKG" "$OMO_NAME" "$ver"
+        fi
+        # 如果更新两者且指定了版本，版本只适用于OC，OMO还是latest
+        if [[ -n "$target_ver" && "$CHECK_OC" == true ]]; then
+            local ver; ver=$(_safe_capture get_remote_version_with_retry "$OMO_PKG")
+            update_package "$OMO_PKG" "$OMO_NAME" "$ver"
+        fi
     fi
     echo ""
+    return 0
+}
+
+# 步骤 0: 零环境安装 Node.js（从国内镜像站）
+# 确保 bun 可用（OMO v4.6.0+ 硬依赖）
+# 输出: 直接打印安装过程，返回 0=可用, 1=安装失败
+_ensure_bun() {
+    command -v bun &>/dev/null && return 0
+
+    echo ""
+    echo -e "  ${YELLOW}OMO v4.6.0+ 需要 bun 运行时，正在安装...${NC}"
+    local bun_install_ok=false
+
+    # --- 策略 1: 通过 npm registry 镜像安装 bun ---
+    # 先尝试加载 nvm 环境（非交互式 SSH 中 npm 可能不自动在 PATH 中）
+    local _nvm_paths=(
+        "$HOME/.nvm/nvm.sh"
+        "$HOME/.config/nvm/nvm.sh"
+        "/usr/local/nvm/nvm.sh"
+        "/opt/nvm/nvm.sh"
+    )
+    local _nvmp
+    for _nvmp in "${_nvm_paths[@]}"; do
+        if [[ -f "$_nvmp" ]]; then
+            source "$_nvmp" >/dev/null 2>&1 || true
+            if command -v nvm &>/dev/null; then
+                nvm use default >/dev/null 2>&1 || nvm use stable >/dev/null 2>&1 || true
+            fi
+            command -v npm &>/dev/null && break
+        fi
+    done
+    if command -v npm &>/dev/null; then
+        echo -e "  ${BLUE}通过 npm registry 安装 bun...${NC}"
+        local bun_npm_install_ok=false
+        local bun_registries=("${NPM_REGISTRY:-https://registry.npmmirror.com}" "https://registry.npmjs.org")
+        local reg
+        for reg in "${bun_registries[@]}"; do
+            echo -e "    npm registry: ${reg}"
+            if npm install -g bun --registry="$reg" 2>&1; then
+                bun_npm_install_ok=true
+                break
+            else
+                echo -e "    ${YELLOW}失败，尝试下一个 registry...${NC}"
+            fi
+        done
+        if [[ "$bun_npm_install_ok" == true ]]; then
+            local bun_bin_dir="$HOME/.bun/bin"
+            mkdir -p "$bun_bin_dir" 2>/dev/null
+            # npm 全局 bin 目录可能不在 PATH 中（如 npm prefix=~/.local 但 ~/.local/bin 不在 PATH）
+            local npm_global_bin; npm_global_bin="$(npm prefix -g 2>/dev/null)/bin"
+            [[ -d "$npm_global_bin" ]] && export PATH="$npm_global_bin:$PATH"
+            hash -r 2>/dev/null || true
+            command -v bun &>/dev/null && ln -sf "$(command -v bun)" "$bun_bin_dir/bun" 2>/dev/null || true
+            command -v bunx &>/dev/null && ln -sf "$(command -v bunx)" "$bun_bin_dir/bunx" 2>/dev/null || true
+            bun_install_ok=true
+        fi
+    fi
+
+    # --- 策略 2: bun.sh 安装脚本 + GITHUB 代理 ---
+    if [[ "$bun_install_ok" == false ]]; then
+        echo -e "  ${BLUE}通过 bun.sh 安装脚本 + GitHub 代理安装 bun...${NC}"
+        local bun_script
+        bun_script=$(curl -fsSL --max-time 30 https://bun.sh/install 2>/dev/null)
+        if [[ -n "$bun_script" ]]; then
+            GITHUB="${GITHUB_PROXY}https://github.com" bash <<< "$bun_script" 2>&1 && bun_install_ok=true
+        fi
+    fi
+
+    # --- 策略 3: 直接通过代理下载 bun 二进制 ---
+    if [[ "$bun_install_ok" == false ]]; then
+        echo -e "  ${BLUE}直接通过 GitHub 代理下载 bun 二进制...${NC}"
+        local _bun_platform target
+        _bun_platform=$(uname -ms)
+        case "$_bun_platform" in
+            *aarch64*|*arm64*) target="linux-aarch64" ;;
+            *x86_64*)         target="linux-x64" ;;
+            *)                target="linux-x64" ;;
+        esac
+        local bun_home="$HOME/.bun"
+        local bun_bin="$bun_home/bin"
+        mkdir -p "$bun_bin" 2>/dev/null
+        local bun_zip_url="${GITHUB_PROXY}https://github.com/oven-sh/bun/releases/latest/download/bun-${target}.zip"
+        local bun_zip_path="/tmp/bun-${target}.zip"
+        echo -e "    下载: ${bun_zip_url}"
+        if curl -fsSL --max-time 180 --output "$bun_zip_path" "$bun_zip_url" 2>/dev/null; then
+            if unzip -oqd "$bun_bin" "$bun_zip_path" 2>/dev/null; then
+                if [[ -f "$bun_bin/bun-${target}/bun" ]]; then
+                    mv "$bun_bin/bun-${target}/bun" "$bun_bin/bun" && chmod +x "$bun_bin/bun" && bun_install_ok=true
+                    rm -rf "$bun_bin/bun-${target}"
+                fi
+            fi
+            rm -f "$bun_zip_path"
+        fi
+    fi
+
+    if [[ "$bun_install_ok" == true ]]; then
+        echo -e "${GREEN}✓ bun 安装成功${NC}"
+        export BUN_HOME="$HOME/.bun"
+        export PATH="$BUN_HOME/bin:$PATH"
+        hash -r 2>/dev/null || true
+        return 0
+    else
+        echo -e "${RED}✗ bun 安装失败${NC}"
+        echo -e "  OMO v4.6.0+ 必须使用 bun，请手动安装:"
+        echo -e "    curl -fsSL https://bun.sh/install | bash"
+        echo -e "  或: npm install -g bun"
+        echo -e "  然后重试: oc-update update --omo"
+        return 1
+    fi
+}
+
+ensure_node_from_mirror() {
+    # 先尝试加载 NVM（非交互式 SSH 中 node/npm 可能不在 PATH）
+    local _nvm_paths=(
+        "$HOME/.nvm/nvm.sh"
+        "$HOME/.config/nvm/nvm.sh"
+        "/usr/local/nvm/nvm.sh"
+        "/opt/nvm/nvm.sh"
+    )
+    local _nvmp
+    for _nvmp in "${_nvm_paths[@]}"; do
+        if [[ -f "$_nvmp" ]]; then
+            source "$_nvmp" >/dev/null 2>&1 || true
+            if command -v nvm &>/dev/null; then
+                nvm use default >/dev/null 2>&1 || nvm use stable >/dev/null 2>&1 || true
+            fi
+            command -v node &>/dev/null && command -v npm &>/dev/null && break
+        fi
+    done
+    
+    command -v node &>/dev/null && command -v npm &>/dev/null && return 0
+    
+    echo ""
+    echo -e "${BOLD}步骤 0: 安装 Node.js 运行时${NC}"
+    echo "─────────────────────────────────────"
+    echo -e "  ${YELLOW}未检测到 Node.js，正在从镜像站安装...${NC}"
+    
+    local node_ver="" target="linux-x64"
+    local platform
+    platform=$(uname -ms)
+    case "$platform" in
+        *aarch64*|*arm64*) target="linux-arm64" ;;
+        *x86_64*)          target="linux-x64" ;;
+    esac
+    
+    # 获取最新 LTS 版本
+    local index_json
+    index_json=$(curl -fsSL --max-time 15 "https://npmmirror.com/mirrors/node/index.json" 2>/dev/null)
+    if [[ -n "$index_json" ]] && command -v python3 &>/dev/null; then
+        node_ver=$(echo "$index_json" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+for v in data:
+    if v.get('lts'):
+        print(v['version'].lstrip('v'))  # JSON 中 version 带 v 前缀，去掉
+        break
+" 2>/dev/null)
+    fi
+    node_ver="${node_ver:-22.22.3}"  # 查询失败时用 LTS 兜底
+    
+    local install_dir="${HOME}/.local"
+    local dl_ok=false
+    local tarball="node-v${node_ver}-${target}.tar.xz"
+    
+    # 镜像链（npmmirror → USTC）
+    local mirrors=(
+        "https://npmmirror.com/mirrors/node"
+        "https://mirrors.ustc.edu.cn/node"
+    )
+    
+    echo -e "  ${BLUE}下载 Node.js v${node_ver} (${target})...${NC}"
+    mkdir -p "$install_dir" 2>/dev/null
+    
+    for mirror in "${mirrors[@]}"; do
+        local url="${mirror}/v${node_ver}/${tarball}"
+        echo -e "    ${BLUE}尝试: ${url}${NC}"
+        if curl -fsSL --max-time 180 "$url" 2>/dev/null | tar -xJ -C "$install_dir" --strip-components=1 2>/dev/null; then
+            dl_ok=true; break
+        fi
+    done
+    
+    if [[ "$dl_ok" == false ]]; then
+        echo -e "  ${YELLOW}镜像站失败，尝试直连 nodejs.org...${NC}"
+        curl -fsSL --max-time 180 "https://nodejs.org/dist/v${node_ver}/${tarball}" 2>/dev/null | tar -xJ -C "$install_dir" --strip-components=1 2>/dev/null && dl_ok=true
+    fi
+    
+    if [[ "$dl_ok" == false ]]; then
+        echo -e "${RED}✗ Node.js 安装失败${NC}"
+        echo -e "  手动安装: 访问 https://nodejs.org 下载"
+        return 1
+    fi
+    
+    export PATH="${install_dir}/bin:$PATH"
+    hash -r 2>/dev/null || true
+    
+    echo -e "${GREEN}✓ Node.js v$(node --version 2>/dev/null) / npm v$(npm --version 2>/dev/null)${NC}"
+    return 0
+}
+
+do_bootstrap() {
+    local target_ver="${1:-}"
+    
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  🚀 从零引导安装${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # 步骤 0: 确保 Node.js 可用（bun 和 OMO 都需要 npm/npx）
+    ensure_node_from_mirror || return 1
+    echo ""
+    
+    # 步骤 1: 确保包管理器可用（bun 是 OMO 推荐）
+    echo -e "${BOLD}步骤 1/3: 检查包管理器环境${NC}"
+    echo "─────────────────────────────────────"
+    
+    if command -v bun &>/dev/null; then
+        echo -e "${GREEN}✓ bun 已安装 ($(bun --version 2>/dev/null || echo '?'))${NC}"
+    else
+        _ensure_bun || return 1
+    fi
+    echo ""
+    
+    echo ""
+    
+    # 步骤 2: 安装 OpenCode + Oh-My-OpenCode
+    echo -e "${BOLD}步骤 2/3: 安装 OpenCode 和 Oh-My-OpenCode${NC}"
+    echo "─────────────────────────────────────"
+    do_install "$target_ver"
+}
+
+# ============================================
+# 自动维护模式（非交互，无人值守升级）
+# ============================================
+do_auto() {
+    AUTO_EXIT_CODE=0
+    local all_ok=true stage1_ok=true stage3_ok=true
+
+    # 用于汇总报告的状态变量
+    local oc_before="N/A" oc_after="N/A" oc_status="skipped"
+    local omo_before="N/A" omo_after="N/A" omo_status="skipped"
+    local cache_before="ok" cache_after="ok" cache_status="ok"
+    local shadow_before="0" shadow_after="0" shadow_status="ok"
+    local tui_status_text="ok"
+    local action_count=0
+
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  🤖 自动维护模式${NC}"
+    [[ "$DRY_RUN" == true ]] && echo -e "${YELLOW}  (试运行 - 不会执行任何修改)${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    # ═══════════════════════════════════════
+    # Stage 1: 环境准备
+    # ═══════════════════════════════════════
+    echo ""
+    echo -e "${BOLD}[1/4] 环境准备${NC}"
+    echo "─────────────────────────────────────"
+
+    # 1a. 加载 NVM / fnm（非交互 SSH 下 npm 可能不在 PATH）
+    local _nvm_paths=(
+        "$HOME/.nvm/nvm.sh"
+        "$HOME/.config/nvm/nvm.sh"
+        "/usr/local/nvm/nvm.sh"
+        "/opt/nvm/nvm.sh"
+    )
+    local _nvmp
+    for _nvmp in "${_nvm_paths[@]}"; do
+        if [[ -f "$_nvmp" ]]; then
+            source "$_nvmp" >/dev/null 2>&1 || true
+            if command -v nvm &>/dev/null; then
+                nvm use default >/dev/null 2>&1 || nvm use stable >/dev/null 2>&1 || true
+            fi
+            command -v npm &>/dev/null && break
+        fi
+    done
+    # 也尝试加载 fnm
+    if command -v fnm &>/dev/null; then
+        eval "$(fnm env --shell bash 2>/dev/null)" || true
+    fi
+    command -v npm &>/dev/null && echo -e "  ${GREEN}✓ npm 可用 ($(npm --version 2>/dev/null || echo '?'))${NC}" \
+        || echo -e "  ${YELLOW}⚠ npm 不可用 (部分功能受限)${NC}"
+
+    # 1b. 确保 bun 可用（OMO v4.6.0+ 硬依赖）
+    if [[ "$CHECK_OMO" == true ]]; then
+        if command -v bun &>/dev/null; then
+            echo -e "  ${GREEN}✓ bun 已可用 ($(bun --version 2>/dev/null || echo '?'))${NC}"
+        else
+            if [[ "$DRY_RUN" == true ]]; then
+                echo -e "  ${YELLOW}  [试运行] 将安装 bun${NC}"
+            else
+                echo -e "  ${BLUE}正在安装 bun...${NC}"
+                if _ensure_bun; then
+                    echo -e "  ${GREEN}✓ bun 安装成功${NC}"
+                else
+                    echo -e "  ${RED}✗ bun 安装失败 (OMO 更新将不可用)${NC}"
+                    stage1_ok=false; all_ok=false
+                fi
+            fi
+        fi
+    fi
+
+    # ═══════════════════════════════════════
+    # Stage 2: 只读扫描
+    # ═══════════════════════════════════════
+    echo ""
+    echo -e "${BOLD}[2/4] 版本扫描${NC}"
+    echo "─────────────────────────────────────"
+
+    # 2a. 本地版本
+    local oc_local="not-installed" omo_local="not-installed"
+    if [[ "$CHECK_OC" == true ]]; then
+        oc_local=$(_safe_capture get_local_version "$OC_PKG")
+        oc_before="$oc_local"
+        echo -e "  OpenCode:         ${CYAN}v$oc_local${NC}"
+    fi
+    if [[ "$CHECK_OMO" == true ]]; then
+        omo_local=$(_safe_capture get_local_version "$OMO_PKG")
+        omo_before="$omo_local"
+        echo -e "  Oh-My-OpenAgent:  ${CYAN}v$omo_local${NC}"
+    fi
+
+    # 2b. 远程版本
+    local oc_remote="unknown" omo_remote="unknown"
+    if [[ "$CHECK_OC" == true ]]; then
+        oc_remote=$(_safe_capture get_remote_version_with_retry "$OC_PKG")
+        if [[ "$oc_remote" != "unknown" ]]; then
+            echo -e "  OpenCode 远程:    ${BLUE}v$oc_remote${NC}"
+        else
+            echo -e "  OpenCode 远程:    ${YELLOW}获取失败${NC}"
+            REMOTE_FETCH_FAILED=1
+        fi
+    fi
+    if [[ "$CHECK_OMO" == true ]]; then
+        omo_remote=$(_safe_capture get_remote_version_with_retry "$OMO_PKG")
+        if [[ "$omo_remote" != "unknown" ]]; then
+            echo -e "  OMO 远程:         ${BLUE}v$omo_remote${NC}"
+        else
+            echo -e "  OMO 远程:         ${YELLOW}获取失败${NC}"
+            REMOTE_FETCH_FAILED=1
+        fi
+    fi
+
+    # 2c. 缓存健康
+    local cache_dir
+    cache_dir=$(_safe_capture _cache_path)
+    local cache_issues=false
+    if [[ -n "$cache_dir" && -d "$cache_dir" ]]; then
+        if _cache_has_old_pkg; then
+            cache_before="old_pkg"
+            cache_issues=true
+            echo -e "  ${YELLOW}⚠ 缓存残留旧包名 $OMO_PKG_OLD${NC}"
+        fi
+        local cache_ver
+        cache_ver=$(_safe_capture _cache_omo_version)
+        if [[ -n "$cache_ver" && "$cache_ver" != "no-cache" && "$cache_ver" != "not-found" \
+              && "$omo_local" != "not-installed" && "$omo_local" != "plugin-configured" && "$cache_ver" != "$omo_local" ]]; then
+            cache_before="mismatch"
+            cache_issues=true
+            echo -e "  ${YELLOW}⚠ 缓存版本与全局不一致: 缓存=v$cache_ver  全局=v$omo_local${NC}"
+        fi
+        if [[ "$cache_issues" == false ]]; then
+            echo -e "  ${GREEN}✓ 缓存健康${NC}"
+        fi
+        # TUI 扫描 (记录但不占用独立行)
+        local tui_st
+        tui_st=$(_safe_capture _check_tui_config)
+        [[ "$tui_st" == "missing-entry" ]] && tui_status_text="missing"
+    fi
+
+    # 2d. PATH 遮蔽扫描
+    local shadow_total=0
+    if [[ "$CHECK_OC" == true && "$oc_local" != "not-installed" ]]; then
+        local oc_inst_path
+        oc_inst_path=$(_safe_capture find_package_path "$OC_PKG")
+        if [[ -n "$oc_inst_path" ]]; then
+            local cache_root
+            cache_root=$(_safe_capture _cache_path)
+            local all_inst
+            all_inst=$(_safe_capture find_all_installations "$OC_PKG" "opencode")
+            local line
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local ip="${line%%|*}"
+                [[ "$ip" == "$oc_inst_path" ]] && continue
+                [[ -n "$cache_root" && "$ip" == "$cache_root/node_modules/"* ]] && continue
+                shadow_total=$((shadow_total + 1))
+            done <<< "$all_inst"
+        fi
+    fi
+    if [[ "$CHECK_OMO" == true && "$omo_local" != "not-installed" && "$omo_local" != "plugin-configured" ]]; then
+        local omo_inst_path
+        omo_inst_path=$(_safe_capture find_package_path "$OMO_PKG")
+        if [[ -n "$omo_inst_path" ]]; then
+            local cache_root2
+            cache_root2=$(_safe_capture _cache_path)
+            local all_inst2
+            all_inst2=$(_safe_capture find_all_installations "$OMO_PKG" "omo")
+            local line2
+            while IFS= read -r line2; do
+                [[ -z "$line2" ]] && continue
+                local ip2="${line2%%|*}"
+                [[ "$ip2" == "$omo_inst_path" ]] && continue
+                [[ -n "$cache_root2" && "$ip2" == "$cache_root2/node_modules/"* ]] && continue
+                shadow_total=$((shadow_total + 1))
+            done <<< "$all_inst2"
+        fi
+    fi
+    if [[ $shadow_total -gt 0 ]]; then
+        shadow_before="$shadow_total"
+        shadow_status="warn"
+        echo -e "  ${YELLOW}⚠ 检测到 $shadow_total 个 PATH 遮蔽${NC}"
+    else
+        echo -e "  ${GREEN}✓ 无 PATH 遮蔽${NC}"
+    fi
+
+    # ═══════════════════════════════════════
+    # Stage 3: 自动修复
+    # ═══════════════════════════════════════
+    echo ""
+    echo -e "${BOLD}[3/4] 自动修复${NC}"
+    echo "─────────────────────────────────────"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        # 试运行模式：只展示计划
+        [[ "$CHECK_OC" == true && "$oc_local" != "not-installed" && "$oc_remote" != "unknown" ]] && \
+            echo -e "  ${YELLOW}  [试运行] 将检查 OpenCode 更新 (v$oc_local → v$oc_remote)${NC}"
+        [[ "$CHECK_OMO" == true && "$omo_local" != "not-installed" && "$omo_remote" != "unknown" ]] && \
+            echo -e "  ${YELLOW}  [试运行] 将检查 OMO 更新 (v$omo_local → v$omo_remote)${NC}"
+        [[ "$cache_before" != "ok" ]] && \
+            echo -e "  ${YELLOW}  [试运行] 将修复缓存问题${NC}"
+        [[ $shadow_total -gt 0 ]] && \
+            echo -e "  ${YELLOW}  [试运行] 将诊断 PATH 遮蔽 ($shadow_total 个)${NC}"
+        [[ "$CHECK_OC" == false && "$CHECK_OMO" == false ]] && \
+            echo -e "  ${YELLOW}  [试运行] 无组件被选中 (--oc 和 --omo 同时设置)${NC}"
+        [[ "$FORCE" == true ]] && \
+            echo -e "  ${BLUE}  [试运行] --force: 实运行时将输出额外诊断${NC}"
+        echo ""
+        echo -e "  ${GREEN}✓ 试运行完成，未执行任何修改${NC}"
+    else
+        # 3a. 缓存清理
+        if [[ "$cache_before" != "ok" ]]; then
+            if _cache_has_old_pkg; then
+                if _cache_clean_old_pkg; then
+                    cache_after="cleaned"
+                    cache_status="fixed"
+                    action_count=$((action_count + 1))
+                else
+                    echo -e "  ${YELLOW}⚠ 缓存旧包名清理失败${NC}"
+                    cache_status="failed"
+                fi
+            fi
+            if [[ "$cache_before" == "mismatch" || "$cache_before" == "old_pkg" ]]; then
+                # 仅清除旧包名后的版本不一致 → 重启 OpenCode 即可
+                cache_after="${cache_after:-cleaned}"
+                cache_status="${cache_status:-fixed}"
+            fi
+        fi
+
+        # 3b. 判断更新需求
+        local oc_needs=false omo_needs=false
+        if [[ "$CHECK_OC" == true && "$oc_local" != "not-installed" && "$oc_remote" != "unknown" ]]; then
+            needs_update "$oc_local" "$oc_remote" && oc_needs=true || true
+        fi
+        if [[ "$CHECK_OMO" == true && "$omo_local" != "not-installed" && "$omo_remote" != "unknown" ]]; then
+            needs_update "$omo_local" "$omo_remote" && omo_needs=true || true
+        fi
+
+        # 3c. OMO 更新（先 OMO 后 OC，因为 OMO 安装器可能修改 opencode.json）
+        if [[ "$CHECK_OMO" == true ]]; then
+            if [[ "$stage1_ok" == false && "$omo_local" != "not-installed" && "$omo_needs" == true ]]; then
+                echo -e "  ${YELLOW}⚠ bun 不可用，跳过 OMO 更新${NC}"
+                omo_status="failed"
+            elif [[ "$omo_local" == "not-installed" ]]; then
+                echo -e "  ${BLUE}ℹ Oh-My-OpenAgent 未安装，跳过${NC}"
+                omo_status="not-installed"
+            elif [[ "$omo_needs" == true ]]; then
+                echo -e "  ${BLUE}更新 OMO: v$omo_local → v$omo_remote${NC}"
+                if update_package "$OMO_PKG" "$OMO_NAME" "$omo_remote"; then
+                    local _ov; _ov=$(_safe_capture get_local_version "$OMO_PKG")
+                    omo_after="$_ov"
+                    omo_status="updated"
+                    action_count=$((action_count + 1))
+                    # 创建 omo 别名
+                    _ensure_omo_symlink || true
+                else
+                    echo -e "  ${RED}✗ OMO 更新失败${NC}"
+                    omo_status="failed"
+                    stage3_ok=false; all_ok=false
+                fi
+            elif [[ "$omo_remote" == "unknown" ]]; then
+                echo -e "  ${YELLOW}⚠ OMO 远程版本获取失败，跳过更新${NC}"
+                omo_status="unknown"
+            else
+                echo -e "  ${GREEN}✓ OMO 已是最新 (v$omo_local)${NC}"
+                omo_after="$omo_local"
+                omo_status="latest"
+            fi
+        fi
+
+        # 3d. OC 更新
+        if [[ "$CHECK_OC" == true ]]; then
+            if [[ "$oc_local" == "not-installed" ]]; then
+                echo -e "  ${BLUE}ℹ OpenCode 未安装，跳过${NC}"
+                oc_status="not-installed"
+            elif [[ "$oc_needs" == true ]]; then
+                echo -e "  ${BLUE}更新 OpenCode: v$oc_local → v$oc_remote${NC}"
+                if update_package "$OC_PKG" "$OC_NAME" "$oc_remote"; then
+                    local _ov2; _ov2=$(_safe_capture get_local_version "$OC_PKG")
+                    oc_after="$_ov2"
+                    oc_status="updated"
+                    action_count=$((action_count + 1))
+                else
+                    echo -e "  ${RED}✗ OpenCode 更新失败${NC}"
+                    oc_status="failed"
+                    stage3_ok=false; all_ok=false
+                fi
+            elif [[ "$oc_remote" == "unknown" ]]; then
+                echo -e "  ${YELLOW}⚠ OpenCode 远程版本获取失败，跳过更新${NC}"
+                oc_status="unknown"
+            else
+                echo -e "  ${GREEN}✓ OpenCode 已是最新 (v$oc_local)${NC}"
+                oc_after="$oc_local"
+                oc_status="latest"
+            fi
+        fi
+
+        # 3e. PATH 遮蔽诊断（不自动卸载，风险太高）
+        if [[ $shadow_total -gt 0 ]]; then
+            echo -e "  ${YELLOW}⚠ 检测到 $shadow_total 个 PATH 遮蔽:${NC}"
+            [[ "$CHECK_OC" == true && "$oc_local" != "not-installed" ]] && \
+                _safe_capture _check_stale_shadowing "$OC_PKG" "opencode" || true
+            [[ "$CHECK_OMO" == true && "$omo_local" != "not-installed" ]] && \
+                _safe_capture _check_stale_shadowing "$OMO_PKG" "omo" || true
+        elif [[ "$FORCE" == true ]]; then
+            echo -e "  ${BLUE}ℹ --force: 详细诊断 PATH 环境...${NC}"
+            [[ "$CHECK_OC" == true && "$oc_local" != "not-installed" ]] && \
+                _safe_capture _check_stale_shadowing "$OC_PKG" "opencode" || true
+            [[ "$CHECK_OMO" == true && "$omo_local" != "not-installed" ]] && \
+                _safe_capture _check_stale_shadowing "$OMO_PKG" "omo" || true
+        fi
+
+        # 3f. TUI 配置漂移提示
+        if [[ "$tui_status_text" == "missing" ]]; then
+            echo -e "  ${YELLOW}⚠ TUI 配置缺失 oh-my-openagent/tui 条目${NC}"
+            echo -e "  ${BLUE}💡 重新运行 OMO 安装器可修复: bunx oh-my-openagent install${NC}"
+        fi
+        # 3g. --force 模式额外诊断
+        if [[ "$FORCE" == true && "$tui_status_text" == "ok" ]]; then
+            echo -e "  ${BLUE}ℹ --force: TUI 配置正常${NC}"
+        fi
+
+        if [[ "$CHECK_OC" == false && "$CHECK_OMO" == false ]]; then
+            echo -e "  ${YELLOW}⚠ 无组件被选中 (--oc 和 --omo 同时设置)${NC}"
+        elif [[ $action_count -eq 0 && "$stage3_ok" == true && "$shadow_total" -eq 0 && "$tui_status_text" == "ok" ]]; then
+            echo -e "  ${GREEN}✓ 无需操作，系统已是最新${NC}"
+        fi
+    fi
+
+    # ═══════════════════════════════════════
+    # Stage 4: 验证与报告
+    # ═══════════════════════════════════════
+    echo ""
+    echo -e "${BOLD}[4/4] 验证与报告${NC}"
+    echo "─────────────────────────────────────"
+
+    # 只在实运行且有更新时验证
+    if [[ "$DRY_RUN" == false ]]; then
+        if [[ "$oc_status" == "updated" ]]; then
+            local oc_verify; oc_verify=$(_safe_capture get_local_version "$OC_PKG")
+            if [[ "$oc_verify" != "$oc_before" ]]; then
+                echo -e "  ${GREEN}✓ OpenCode 已更新: v$oc_before → v$oc_verify${NC}"
+            else
+                echo -e "  ${YELLOW}⚠ OpenCode 版本未变更 (仍为 v$oc_verify)${NC}"
+            fi
+        fi
+        if [[ "$omo_status" == "updated" ]]; then
+            local omo_verify; omo_verify=$(_safe_capture get_local_version "$OMO_PKG")
+            if [[ "$omo_verify" != "$omo_before" ]]; then
+                echo -e "  ${GREEN}✓ OMO 已更新: v$omo_before → v$omo_verify${NC}"
+            else
+                echo -e "  ${YELLOW}⚠ OMO 版本未变更 (仍为 v$omo_verify)${NC}"
+            fi
+        fi
+    fi
+    [[ "$DRY_RUN" == true ]] && echo -e "  ${BLUE}ℹ 试运行模式，跳过验证${NC}"
+
+    # 试运行模式补充 after 字段（不执行修改，显示当前状态）
+    if [[ "$DRY_RUN" == true ]]; then
+        [[ "$oc_after" == "N/A" ]] && oc_after="$oc_before"
+        [[ "$omo_after" == "N/A" ]] && omo_after="$omo_before"
+        [[ "$cache_after" == "ok" && "$cache_before" != "ok" ]] && cache_after="$cache_before"
+        shadow_after="$shadow_before"
+    fi
+    # PATH 遮蔽不自动修复，之后列显示与之前相同
+    shadow_after="$shadow_before"
+
+    # 状态图标映射
+    local oc_icon="—" omo_icon="—" cache_icon="—" shadow_icon="—"
+    case "$oc_status" in
+        updated|latest) oc_icon="✅" ;;
+        pending) oc_icon="⏳" ;;
+        skipped|not-installed) oc_icon="—" ;;
+        failed) oc_icon="❌" ;;
+        *) oc_icon="⚠️" ;;
+    esac
+    case "$omo_status" in
+        updated|latest) omo_icon="✅" ;;
+        pending) omo_icon="⏳" ;;
+        skipped|not-installed) omo_icon="—" ;;
+        failed) omo_icon="❌" ;;
+        *) omo_icon="⚠️" ;;
+    esac
+    case "$cache_status" in ok|fixed) cache_icon="✅" ;; failed) cache_icon="❌" ;; *) cache_icon="⚠️" ;; esac
+    case "$shadow_status" in ok) shadow_icon="✅" ;; *) shadow_icon="⚠️" ;; esac
+
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  📊 自动维护报告${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    printf "  %-20s %-16s %-16s %s %s\n" "Component" "Before" "After" "" "Status"
+    echo "  ──────────────────── ──────────────── ──────────────── ────── ──────"
+    printf "  %-20s %-16s %-16s %s %s\n" "OpenCode" "v$oc_before" "v$oc_after" "$oc_icon" "$oc_status"
+    printf "  %-20s %-16s %-16s %s %s\n" "Oh-My-OpenAgent" "v$omo_before" "v$omo_after" "$omo_icon" "$omo_status"
+    printf "  %-20s %-16s %-16s %s %s\n" "Cache" "$cache_before" "$cache_after" "$cache_icon" "$cache_status"
+    printf "  %-20s %-16s %-16s %s %s\n" "PATH Shadowing" "$shadow_before" "$shadow_after" "$shadow_icon" "$shadow_status"
+    echo ""
+
+    # 网络异常提示
+    if [[ "${REMOTE_FETCH_FAILED:-}" == "1" ]]; then
+        echo -e "${YELLOW}⚠️  网络异常，部分远程版本获取失败${NC}"
+        echo -e "ℹ️  可设置: export NPM_REGISTRY=https://registry.npmmirror.com"
+        echo -e "ℹ️  可设置: export GITHUB_PROXY=https://gh.llkk.cc/"
+        echo ""
+    fi
+
+    # 试运行提示
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${BLUE}💡 这是试运行模式。直接运行 oc-update auto 执行实际操作。${NC}"
+    fi
+
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    # 设定退出码: 0=全部成功, 1=部分失败, 2=全部失败/网络不可用
+    local _has_unknown=false
+    if [[ "$CHECK_OC" == true && "$oc_remote" == "unknown" && "$oc_local" != "not-installed" ]]; then
+        _has_unknown=true
+    fi
+    if [[ "$CHECK_OMO" == true && "$omo_remote" == "unknown" && "$omo_local" != "not-installed" ]]; then
+        _has_unknown=true
+    fi
+    if [[ "$DRY_RUN" == true ]]; then
+        AUTO_EXIT_CODE=0
+    elif [[ "$_has_unknown" == true && "$action_count" -eq 0 ]]; then
+        AUTO_EXIT_CODE=2  # 全部因网络不可用被跳过
+    elif [[ "$all_ok" == true ]]; then
+        AUTO_EXIT_CODE=0
+    elif [[ "$stage3_ok" == true ]]; then
+        AUTO_EXIT_CODE=0  # 仅警告不视为失败
+    else
+        AUTO_EXIT_CODE=1
+    fi
+    return 0  # 必须返回 0，ERR trap 由 caller 的 exit $AUTO_EXIT_CODE 绕过
+}
+
+do_install() {
+    local target_ver="${1:-}"
+    
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  📦 安装${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    local installed_any=false
+    local skipped_any=false
+
+    # 安装 OpenCode
+    if [[ "$CHECK_OC" == true ]]; then
+        local local_ver
+        local_ver=$(get_local_version "$OC_PKG")
+
+        if [[ "$local_ver" == "not-installed" ]]; then
+            # 检测是否有可用的包管理器
+            local has_pm=false
+            for pm_check in npm pnpm bun yarn; do
+                command -v "$pm_check" &>/dev/null && has_pm=true && break
+            done
+
+            if [[ "$has_pm" == false ]]; then
+                # 无包管理器 → 用官方 curl 安装器（含网络容错）
+                echo -e "  ${YELLOW}未检测到 npm/pnpm/bun/yarn，使用官方安装器${NC}"
+
+                local install_ok=false
+
+                # 尝试 1: 直连 opencode.ai（VPN 用户或已翻墙）
+                echo -e "  ${BLUE}尝试 1: 直连 https://opencode.ai/install ...${NC}"
+                if curl -fsSL https://opencode.ai/install 2>/dev/null | bash 2>&1; then
+                    install_ok=true
+                fi
+
+                # 尝试 2: 通过 GitHub 代理下载安装脚本（中国网络环境）
+                if [[ "$install_ok" != true ]]; then
+                    echo -e "  ${YELLOW}直连失败，尝试通过 GitHub 代理获取安装脚本...${NC}"
+                    local install_script
+                    install_script=$(get_url "https://raw.githubusercontent.com/anomaly/opencode/main/scripts/install.sh" 2>/dev/null)
+                    if [[ -n "$install_script" ]]; then
+                        echo "$install_script" | bash 2>&1 && install_ok=true
+                    fi
+                    if [[ "$install_ok" != true ]]; then
+                        install_script=$(get_url "https://raw.githubusercontent.com/anomaly/opencode/main/install.sh" 2>/dev/null)
+                        if [[ -n "$install_script" ]]; then
+                            echo "$install_script" | bash 2>&1 && install_ok=true
+                        fi
+                    fi
+                fi
+
+                if [[ "$install_ok" == true ]]; then
+                    echo -e "${GREEN}✓ OpenCode 安装成功${NC}"
+                    hash -r 2>/dev/null || true
+                    local new_ver
+                    new_ver=$(get_local_version "$OC_PKG")
+                    if [[ "$new_ver" != "not-installed" ]]; then
+                        echo -e "  ${BLUE}版本: ${CYAN}v$new_ver${NC}"
+                    fi
+                    installed_any=true
+                else
+                    echo -e "${RED}✗ 所有安装方式均失败${NC}"
+                    echo -e "  可尝试以下替代方案:"
+                    echo -e "    1. 安装 bun（自带包管理器）:"
+                    echo -e "       curl -fsSL https://bun.sh/install | bash"
+                    echo -e "       装好后自动重试:  oc-update install --oc"
+                    echo -e "    2. 或用现有 npm/pnpm 加镜像安装:"
+                    echo -e "       npm install -g opencode-ai --registry=${NPM_REGISTRIES[0]}"
+                    echo -e "       pnpm add -g opencode-ai --registry=${NPM_REGISTRIES[0]}"
+                    echo -e "    3. 或已有 bun 的话全局安装:"
+                    echo -e "       bun add -g opencode-ai"
+                    echo -e "    4. 或从 GitHub Release 手动下载（走代理）:"
+                    echo -e "       export GITHUB_PROXY=https://gh.llkk.cc/"
+                    echo -e "       curl -LO \${GITHUB_PROXY}https://github.com/anomaly/opencode/releases/latest/download/opencode-linux-x64.tar.gz"
+                fi
+            else
+                # 有包管理器 → 复用 update_package
+                local ver="${target_ver}"
+                if [[ -z "$ver" ]]; then
+                    ver=$(_safe_capture get_remote_version_with_retry "$OC_PKG")
+                fi
+                if [[ "$ver" == "unknown" ]]; then
+                    echo -e "${RED}✗ 无法获取 OpenCode 最新版本，请检查网络连接${NC}"
+                    echo -e "  可尝试手动安装: npm install -g opencode-ai"
+                else
+                    update_package "$OC_PKG" "$OC_NAME" "$ver" && installed_any=true
+                fi
+            fi
+        else
+            echo -e "${GREEN}✓ OpenCode 已安装 (v$local_ver)，跳过安装${NC}"
+            echo -e "  使用 oc-update update --oc 升级到最新版本"
+            skipped_any=true
+        fi
+        echo ""
+    fi
+
+    # 安装 Oh-My-OpenCode
+    if [[ "$CHECK_OMO" == true ]]; then
+        local local_ver
+        local_ver=$(get_local_version "$OMO_PKG")
+
+        if [[ "$local_ver" == "not-installed" || "$local_ver" == "plugin-configured" ]]; then
+            if [[ "$local_ver" == "plugin-configured" ]]; then
+                echo -e "  ${BLUE}OMO 已注册为 OpenCode 插件，正在下载...${NC}"
+            else
+                echo -e "  ${CYAN}正在安装 Oh-My-OpenCode...${NC}"
+            fi
+            echo -e "  ${BLUE}使用官方安装命令: bunx oh-my-openagent install${NC}"
+            echo -e "  ${BLUE}(OMO 是 OpenCode 插件，不能用 npm install -g)${NC}"
+
+            # 构建包名 spec（支持版本锁定）
+            local omo_pkg_spec="oh-my-openagent"
+            if [[ -n "$target_ver" && "$target_ver" =~ ^[0-9] ]]; then
+                omo_pkg_spec="oh-my-openagent@${target_ver}"
+            fi
+
+            # 构建 registry fallback 列表
+            local d_registries=()
+            local d_seen=""
+            for r in "$NPM_REGISTRY" "${NPM_REGISTRIES[@]}"; do
+                local d_skip=false
+                for s in "${d_registries[@]}"; do
+                    [[ "$s" == "$r" ]] && d_skip=true && break
+                done
+                [[ "$d_skip" == false ]] && d_registries+=("$r")
+            done
+            if ! printf '%s\n' "${d_registries[@]}" | grep -qx 'https://registry.npmjs.org'; then
+                d_registries+=("https://registry.npmjs.org")
+            fi
+
+            local omo_install_ok=false
+
+            # OMO v4.6.0+ 硬依赖 bun，先确保可用
+            _ensure_bun || { echo -e "${RED}✗ 无法安装 Oh-My-OpenCode（需要 bun）${NC}"; return 1; }
+
+            echo -e "  ${BLUE}检测到 bun，尝试各 registry...${NC}"
+            for registry in "${d_registries[@]}"; do
+                export BUN_CONFIG_REGISTRY="$registry"
+                if bunx --bun "$omo_pkg_spec" install --no-tui --skip-auth --claude=no --gemini=no --copilot=no 2>&1; then
+                    omo_install_ok=true
+                    break
+                fi
+                echo -e "  ${YELLOW}  镜像 $registry 失败，尝试下一个...${NC}"
+                rm -rf "$HOME/.bun/install/cache/oh-my-openagent"* "$HOME/.bun/install/cache/oh-my-opencode"* 2>/dev/null || true
+            done
+
+            if [[ "$omo_install_ok" == true ]]; then
+                _cache_clean_old_pkg
+                # 验证安装
+                local new_ver
+                new_ver=$(get_local_version "$OMO_PKG" 2>/dev/null)
+                if [[ -n "$new_ver" && "$new_ver" != "not-installed" && "$new_ver" != "plugin-configured" ]]; then
+                    echo -e "${GREEN}✓ Oh-My-OpenCode 安装成功 (v$new_ver)${NC}"
+                else
+                    echo -e "${GREEN}✓ Oh-My-OpenCode 安装器执行完成${NC}"
+                    echo -e "  ${BLUE}验证: bunx oh-my-openagent doctor${NC}"
+                fi
+                installed_any=true
+
+                _ensure_omo_symlink
+            else
+                echo -e "${RED}✗ Oh-My-OpenCode 安装失败${NC}"
+                echo -e "  手动安装: bunx oh-my-openagent install"
+            fi
+        else
+            echo -e "${GREEN}✓ Oh-My-OpenCode 已安装 (v$local_ver)，跳过安装${NC}"
+            echo -e "  使用 oc-update update --omo 升级到最新版本"
+            skipped_any=true
+        fi
+        echo ""
+    fi
+
+    # 汇总与首次安装后配置
+    if [[ "$installed_any" == false && "$skipped_any" == true ]]; then
+        echo -e "${YELLOW}所有包均已安装，无需操作。${NC}"
+        echo -e "使用 oc-update update 升级到最新版本。"
+        echo ""
+    elif [[ "$installed_any" == true ]]; then
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${GREEN}✓ 安装完成${NC}"
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+
+        # 首次安装后配置：启用自动更新
+        if [[ "$CHECK_OC" == true ]]; then
+            if [[ -f "$OC_CONFIG" ]]; then
+                echo -e "  ${BLUE}配置 OpenCode 自动更新...${NC}"
+                set_oc_autoupdate "true" 2>/dev/null || true
+            else
+                # 创建初始配置文件
+                mkdir -p "$(dirname "$OC_CONFIG")" 2>/dev/null || true
+                echo '{"autoupdate": true}' > "$OC_CONFIG" 2>/dev/null &&                     echo -e "  ${BLUE}已创建 OpenCode 配置文件并启用自动更新${NC}" || true
+            fi
+        fi
+
+        if [[ "$CHECK_OMO" == true ]]; then
+            local omo_cfg; omo_cfg=$(_omo_config_path)
+            if [[ -f "$omo_cfg" ]]; then
+                echo -e "  ${BLUE}配置 Oh-My-OpenCode 自动更新...${NC}"
+                set_omo_auto_update "true" 2>/dev/null || true
+                remove_omo_disabled_hook 2>/dev/null || true
+            else
+                echo '{"auto_update": true}' > "$omo_cfg" 2>/dev/null &&                     echo -e "  ${BLUE}已创建 Oh-My-OpenCode 配置文件并启用自动更新${NC}" || true
+            fi
+        fi
+
+        echo ""
+        echo -e "  运行 oc-update config 查看配置详情"
+        echo -e "  运行 oc-update disable all 关闭自动更新"
+        echo ""
+    fi
 }
 
 do_disable() {
@@ -1335,7 +3126,7 @@ do_disable() {
             set_oc_autoupdate "false"
             echo -e "${GREEN}✓ autoupdate = false${NC}"
             ;;
-        omo|oh-my-opencode)
+        omo|oh-my-opencode|oh-my-openagent)
             echo -e "${BOLD}禁用 Oh-My-OpenCode 自动更新...${NC}"
             set_omo_auto_update "false"
             add_omo_disabled_hook
@@ -1365,7 +3156,7 @@ do_enable() {
             set_oc_autoupdate "true"
             echo -e "${GREEN}✓ autoupdate = true${NC}"
             ;;
-        omo|oh-my-opencode)
+        omo|oh-my-opencode|oh-my-openagent)
             echo -e "${BOLD}启用 Oh-My-OpenCode 自动更新...${NC}"
             set_omo_auto_update "true"
             remove_omo_disabled_hook
@@ -1387,31 +3178,111 @@ do_enable() {
     esac
 }
 
+show_summary() {
+    local oc_ver; oc_ver=$(get_local_version "$OC_PKG" 2>/dev/null)
+    local omo_ver; omo_ver=$(get_local_version "$OMO_PKG" 2>/dev/null)
+    local oc_pm; oc_pm=$(detect_package_manager "$OC_PKG" 2>/dev/null)
+    local omo_pm; omo_pm=$(detect_package_manager "$OMO_PKG" 2>/dev/null)
+    local oc_path; oc_path=$(_safe_capture find_package_path "$OC_PKG")
+    local omo_path; omo_path=$(_safe_capture find_package_path "$OMO_PKG")
+
+    echo ""
+    echo -e "${BOLD}oc-update${NC} v${VERSION}  —  ${CYAN}OpenCode${NC} + ${CYAN}Oh-My-OpenAgent${NC} 版本管理"
+    echo "────────────────────────────────────────────────────"
+
+    # OpenCode
+    if [[ "$oc_ver" != "not-installed" && -n "$oc_ver" ]]; then
+        echo -e "  OpenCode         ${GREEN}v$oc_ver${NC}     ✓ 已安装"
+        echo -e "  包管理器         ${CYAN}$oc_pm${NC}"
+        if [[ -n "$oc_path" ]]; then
+            echo -e "  路径             ${CYAN}$oc_path${NC}"
+        fi
+    else
+        echo -e "  OpenCode         ${YELLOW}未安装${NC}"
+    fi
+    echo ""
+
+    # Oh-My-OpenAgent
+    if [[ "$omo_ver" != "not-installed" && -n "$omo_ver" ]]; then
+        echo -e "  Oh-My-OpenAgent  ${GREEN}v$omo_ver${NC}     ✓ 已安装"
+        echo -e "  包管理器         ${CYAN}$omo_pm${NC}"
+        if [[ -n "$omo_path" ]]; then
+            echo -e "  路径             ${CYAN}$omo_path${NC}"
+        fi
+    else
+        echo -e "  Oh-My-OpenAgent  ${YELLOW}未安装${NC}"
+    fi
+
+    # --- v1.6.0: 缓存一致性快速检查 ---
+    local cache_ver; cache_ver=$(_safe_capture _cache_omo_version)
+    if [[ -n "$cache_ver" && "$cache_ver" != "no-cache" && "$cache_ver" != "not-found" && "$omo_ver" != "not-installed" && "$omo_ver" != "plugin-configured" && -n "$omo_ver" && "$cache_ver" != "$omo_ver" ]]; then
+        echo -e "  ${YELLOW}⚠ OMO 缓存版本不一致 (全局 v$omo_ver vs 缓存 v$cache_ver) — 运行 oc-update config 查看详情${NC}"
+    elif _cache_has_old_pkg 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠ 缓存中存在旧包名 $OMO_PKG_OLD — 运行 oc-update config 查看详情${NC}"
+    fi
+
+    # --- v1.7.0: PATH 遮蔽快速检查 ---
+    if [[ "$omo_ver" != "not-installed" && -n "$omo_path" ]]; then
+        local omo_shadow_count=0
+        local cache_root_sh; cache_root_sh=$(_safe_capture _cache_path)
+        for inst in $(find_all_installations "$OMO_PKG" "omo" 2>/dev/null); do
+            local ip_sh="${inst%%|*}"
+            [[ "$ip_sh" == "$omo_path" ]] && continue
+            [[ -n "$cache_root_sh" && "$ip_sh" == "$cache_root_sh/node_modules/"* ]] && continue
+            omo_shadow_count=$((omo_shadow_count + 1))
+        done
+        if [[ $omo_shadow_count -gt 0 ]]; then
+            echo -e "  ${YELLOW}⚠ 检测到多个 OMO 安装，可能存在 PATH 遮蔽 — 运行 oc-update config 查看详情${NC}"
+        fi
+    fi
+
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${BLUE}oc-update --help${NC}    查看全部命令"
+    echo -e "  ${BLUE}oc-update check${NC}     检查更新"
+    echo -e "  ${BLUE}oc-update update${NC}    更新到最新版"
+    echo -e "  ${BLUE}oc-update bootstrap${NC} 从零安装（新环境）"
+    echo ""
+}
+
 show_help() {
     cat << 'EOF'
-Usage: oc-update <command> [options]
+Usage: oc-update <command> [options] [version]
 
 Commands:
-  check [--oc|--omo]     检查更新，询问是否更新
-  update [--oc|--omo]    直接更新，不询问
-  disable [oc|omo|all]   禁用自动更新检查
-  enable [oc|omo|all]    启用自动更新检查
-  config                 显示当前配置
-  version                显示当前oc-update版本号
-  help                   显示帮助信息
+  check [--oc|--omo]             检查更新，询问是否更新
+  update [--oc|--omo] [version]  更新到最新版或指定版本
+  install [--oc|--omo] [version] 安装 OpenCode/OMO（跳过已安装的）
+  bootstrap [--oc|--omo]        从零安装：先装 bun（如缺失），再装OC+OMO
+  auto [--dry-run|--force]     [新] 自动维护：扫描→修复→报告，非交互无人值守
+  disable [oc|omo|all]           禁用自动更新检查
+  enable [oc|omo|all]            启用自动更新检查
+  config                         显示当前配置及缓存健康检查
+  version                        显示当前oc-update版本号
+  help                           显示帮助信息
 
 Options:
   --oc          仅操作 OpenCode
   --omo         仅操作 Oh-My-OpenCode
+  --dry-run     试运行模式（仅显示计划，不执行修改）
+  --force       强制诊断模式（显示 PATH/TUI 等额外健康检查信息）
   -v, --version 显示版本号
   -h, --help    显示帮助信息
 
 Examples:
-  oc-update check          # 检查所有，询问是否更新
-  oc-update update         # 直接更新所有
-  oc-update check --oc     # 仅检查 OpenCode
-  oc-update disable all    # 禁用所有自动更新
-  oc-update enable omo     # 启用 OMO 自动更新
+  oc-update check                 # 检查所有，询问是否更新
+  oc-update update                # 直接更新所有
+  oc-update install               # 安装未安装的包（跳过已安装的）
+  oc-update install --oc          # 仅安装 OpenCode
+  oc-update install --oc 1.15.11  # 安装指定版本的 OpenCode
+  oc-update bootstrap             # 从零安装：自动装 bun + OC + OMO
+  oc-update bootstrap --omo       # 从零安装 OMO（无 bun 时先装 bun）
+  oc-update auto                  # 自动维护：扫描→修复→报告（非交互）
+  oc-update auto --dry-run        # 自动维护试运行（仅查看计划）
+  oc-update check --oc            # 仅检查 OpenCode
+  oc-update update --oc 1.15.11   # 将OC更新到指定版本
+  oc-update disable all           # 禁用所有自动更新
+  oc-update enable omo            # 启用 OMO 自动更新
 EOF
 }
 
@@ -1445,18 +3316,32 @@ main() {
         case "$1" in
             --oc)  CHECK_OMO=false; shift ;;
             --omo) CHECK_OC=false; shift ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --force)   FORCE=true; shift ;;
             -h|--help) show_help; exit 0 ;;
             -v|--version) echo "oc-update v$VERSION"; exit 0 ;;
             *) break ;;
         esac
     done
 
+    local target_ver="${1:-}"  # 可选的版本号参数
+    
     case "$cmd" in
         check)
-            do_check
+            do_check "$target_ver"
             ;;
         update)
-            do_update
+            do_update "$target_ver"
+            ;;
+        install)
+            do_install "$target_ver"
+            ;;
+        bootstrap)
+            do_bootstrap "$target_ver"
+            ;;
+        auto|--auto)
+            do_auto
+            exit "${AUTO_EXIT_CODE:-0}"
             ;;
         disable)
             do_disable "${1:-all}"
@@ -1467,8 +3352,11 @@ main() {
         config)
             show_config
             ;;
-        -h|--help|"")
+        -h|--help)
             show_help
+            ;;
+        "")
+            show_summary
             ;;
         *)
             echo -e "${RED}Unknown command: $cmd${NC}"
@@ -1479,3 +3367,4 @@ main() {
 }
 
 main "$@"
+exit 0
