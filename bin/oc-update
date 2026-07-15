@@ -158,7 +158,7 @@ OMO_CONFIG="$CONFIG_DIR/oh-my-opencode.json"
 OMO_CONFIG_NEW="$CONFIG_DIR/oh-my-openagent.json"
 
 # Version
-VERSION="1.8.0"
+VERSION="1.9.0"
 
 # Flags
 CHECK_OC=true
@@ -312,7 +312,7 @@ except Exception:
         fi
     fi
 
-    [[ "$cleaned" == false ]] && return 1
+    [[ "$cleaned" == false ]] && return 0
     # 提示重启
     echo -e "  ${BLUE}💡 请重启 OpenCode 以使用最新 OMO 插件${NC}"
 }
@@ -442,20 +442,14 @@ _sync_omo_cache() {
     if [[ -n "$global_path" && -f "$global_path/package.json" ]]; then
         global_ver=$(grep '"version"' "$global_path/package.json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
     fi
-    # 全局版本为空或与缓存一致 → 无需同步
+    # 全局版本为空 → 无需同步
     [[ -z "$global_ver" ]] && return 0
-    # 不降级：缓存版本比全局新 → 跳过（可能用户手动升级了缓存）
-    if [[ -n "$cache_ver" && "$cache_ver" > "$global_ver" ]]; then
+    # 不降级：缓存版本比全局新 → 跳过（使用 version_gt 进行数值比较）
+    if [[ -n "$cache_ver" ]] && version_gt "$cache_ver" "$global_ver"; then
         log_debug "缓存版本 v$cache_ver 比全局 v$global_ver 新，跳过同步（不降级）"
         return 0
     fi
     [[ "$global_ver" == "$cache_ver" ]] && return 0
-
-    # 环境变量 OC_NO_CACHE_SYNC=1 可跳过
-    if [[ "${OC_NO_CACHE_SYNC:-}" == "1" ]]; then
-        log_debug "OC_NO_CACHE_SYNC=1，跳过缓存同步"
-        return 0
-    fi
 
     # 自动同步（无提示），使用精确版本号而非 @latest
     echo -e "  ${BLUE}同步 OMO 缓存: v$cache_ver → v$global_ver${NC}"
@@ -3517,7 +3511,7 @@ main() {
         config)
             if [[ "$target_ver" == "--fix" ]]; then
                 echo -e "${BOLD}OMO 缓存修复:${NC}"
-                _cache_clean_old_pkg
+                _cache_clean_old_pkg || true
                 _sync_omo_cache
                 echo ""
                 echo -e "${BLUE}💡 请重启 OpenCode 以使用最新 OMO 插件${NC}"
