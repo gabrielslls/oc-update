@@ -377,8 +377,8 @@ _warn_cache_mismatch() {
         echo -e "    全局安装: ${CYAN}v$global_ver${NC}  →  缓存: ${YELLOW}v$cache_ver${NC}"
         echo -e "    OpenCode 实际使用缓存版本，更新全局不会生效！"
         echo -e "    ${BOLD}修复:${NC}"
-        echo -e "      cd '$(_cache_path)' && bun add $OMO_PKG_NEW@latest"
-        echo -e "      然后重启 OpenCode"
+        echo -e "      cd '$(_cache_path)' && bun add $OMO_PKG_NEW@$global_ver"
+        echo -e "      或运行: oc-update config --fix"
         issues_found=true
     fi
 
@@ -411,6 +411,72 @@ _warn_cache_mismatch() {
     esac
 
     [[ "$issues_found" == true ]] && return 1 || return 0
+}
+
+# 自动同步 OMO 缓存版本（无提示，幂等）
+# 在 OMO 升级成功后调用，将缓存同步到全局版本
+# 返回 0=已同步/无需同步, 1=同步失败
+# 环境变量 OC_NO_CACHE_SYNC=1 可跳过
+_sync_omo_cache() {
+    [[ "${OC_NO_CACHE_SYNC:-}" == "1" ]] && return 0
+
+    local cache_dir
+    cache_dir=$(_cache_path)
+    [[ -z "$cache_dir" || ! -d "$cache_dir/node_modules" ]] && return 0
+
+    # 确保缓存已初始化（有 package.json 或 bun.lock），否则跳过
+    if [[ ! -f "$cache_dir/package.json" && ! -f "$cache_dir/bun.lock" ]]; then
+        log_debug "缓存目录未初始化（无 package.json/bun.lock），跳过同步"
+        return 0
+    fi
+
+    # 检测缓存版本
+    local cache_ver
+    cache_ver=$(_cache_omo_version)
+    [[ "$cache_ver" == "no-cache" || "$cache_ver" == "not-found" ]] && return 0
+
+    # 动态获取全局安装版本（不硬编码路径）
+    local global_path
+    global_path=$(_safe_capture find_package_path "$OMO_PKG")
+    local global_ver=""
+    if [[ -n "$global_path" && -f "$global_path/package.json" ]]; then
+        global_ver=$(grep '"version"' "$global_path/package.json" 2>/dev/null | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' | sed 's/^v//')
+    fi
+    # 全局版本为空或与缓存一致 → 无需同步
+    [[ -z "$global_ver" ]] && return 0
+    # 不降级：缓存版本比全局新 → 跳过（可能用户手动升级了缓存）
+    if [[ -n "$cache_ver" && "$cache_ver" > "$global_ver" ]]; then
+        log_debug "缓存版本 v$cache_ver 比全局 v$global_ver 新，跳过同步（不降级）"
+        return 0
+    fi
+    [[ "$global_ver" == "$cache_ver" ]] && return 0
+
+    # 环境变量 OC_NO_CACHE_SYNC=1 可跳过
+    if [[ "${OC_NO_CACHE_SYNC:-}" == "1" ]]; then
+        log_debug "OC_NO_CACHE_SYNC=1，跳过缓存同步"
+        return 0
+    fi
+
+    # 自动同步（无提示），使用精确版本号而非 @latest
+    echo -e "  ${BLUE}同步 OMO 缓存: v$cache_ver → v$global_ver${NC}"
+    if (cd "$cache_dir" && bun add "$OMO_PKG_NEW@$global_ver" 2>&1); then
+        # 验证：确认缓存版本已更新到目标版本
+        local new_cache_ver
+        new_cache_ver=$(_cache_omo_version)
+        if [[ "$new_cache_ver" == "$global_ver" ]]; then
+            echo -e "  ${GREEN}✓ OMO 缓存已同步到 v$global_ver${NC}"
+            echo -e "  ${BLUE}💡 请重启 OpenCode 以使用最新 OMO 插件${NC}"
+            return 0
+        else
+            echo -e "  ${YELLOW}⚠ 缓存同步后版本验证失败 (期望 v$global_ver, 实际 v$new_cache_ver)${NC}"
+            echo -e "  ${YELLOW}  可手动执行: cd '$cache_dir' && bun add $OMO_PKG_NEW@$global_ver${NC}"
+            return 1
+        fi
+    else
+        echo -e "  ${YELLOW}⚠ 缓存同步失败，可手动执行:${NC}"
+        echo -e "    cd '$cache_dir' && bun add $OMO_PKG_NEW@$global_ver"
+        return 1
+    fi
 }
 
 # 检测 OMO 是否作为 OpenCode 插件注册（OMO v4.6.0+ 插件架构）
@@ -482,12 +548,29 @@ _check_stale_shadowing() {
         [[ "$inst_path" == *"/.local/share/pnpm/"* ]] && shadow_pm="pnpm"
         [[ "$inst_path" == *"/yarn/"* ]] && shadow_pm="yarn"
 
-        local uninstall_cmd
+        # 反推该安装实际所在前缀（npm 形态: <prefix>/lib/node_modules/<pkg>，需上溯三级）
+        local shadow_prefix=""
+        shadow_prefix="$(dirname "$(dirname "$(dirname "$inst_path")")")" 2>/dev/null || true
+        local shadow_root="$shadow_prefix/lib/node_modules"
+
+        local uninstall_cmd=""
+        local shadow_note=""
         case "$shadow_pm" in
             bun)  uninstall_cmd="bun remove -g $uninstall_pkg" ;;
             pnpm) uninstall_cmd="pnpm remove -g $uninstall_pkg" ;;
             yarn) uninstall_cmd="yarn global remove $uninstall_pkg" ;;
-            npm)  uninstall_cmd="npm uninstall -g $uninstall_pkg" ;;
+            npm)
+                # 安装位于非默认 npm 前缀（如 /usr/local 与当前 npm 全局根 ~/.local 不一致）时，
+                # 普通 npm uninstall -g 因前缀错位而删不到。脚本只给出正确的手工命令，不自动执行。
+                local cur_npm_root
+                cur_npm_root="$(npm root -g 2>/dev/null)"
+                if [[ -n "$cur_npm_root" && "$shadow_root" != "$cur_npm_root" ]]; then
+                    uninstall_cmd="sudo npm uninstall -g $uninstall_pkg --prefix $shadow_prefix"
+                    shadow_note="该路径不在当前 npm 全局根内，普通 npm uninstall -g 删不到，已加 sudo"
+                else
+                    uninstall_cmd="npm uninstall -g $uninstall_pkg"
+                fi
+                ;;
             *)    uninstall_cmd="npm uninstall -g $uninstall_pkg" ;;
         esac
 
@@ -496,7 +579,8 @@ _check_stale_shadowing() {
             if version_gt "$primary_ver" "$inst_ver"; then
                 echo -e "  ${YELLOW}⚠ 旧版本遮挡风险: $inst_path (v${inst_ver:-?})${NC}"
                 echo -e "    此版本 (v$inst_ver) < 当前版本 (v$primary_ver)，在 PATH 中可能遮挡新安装"
-                echo -e "    ${BOLD}修复:${NC} $uninstall_cmd"
+                echo -e "    ${BOLD}修复(请手工执行):${NC} $uninstall_cmd"
+                [[ -n "$shadow_note" ]] && echo -e "    ${YELLOW}$shadow_note${NC}"
                 shadow_found=true
             else
                 echo -e "  ${BLUE}ℹ 冗余安装: $inst_path (v${inst_ver:-?})${NC}"
@@ -1547,11 +1631,70 @@ update_package() {
     local pm
     pm=$(detect_package_manager "$pkg")
     echo -e "  ${BLUE}检测到包管理器: $pm${NC}"
-    
+
     # 查找当前安装路径
     local pkg_path
     pkg_path=$(_safe_capture find_package_path "$pkg")
-    
+
+    # 非默认全局前缀告警：安装位于当前包管理器全局根之外的系统/自定义前缀时，
+    # 自动更新会写到错误位置而失效。脚本不做自动修改，仅告警并给出手工命令；
+    # 同时提供「卸载该全局安装」的可选项（需用户确认才执行）。
+    if [[ "$pkg" != "$OMO_PKG_OLD" && "$pkg" != "$OMO_PKG_NEW" && -n "$pkg_path" && "$pkg_path" == *"/lib/node_modules/$pkg" ]]; then
+        local _npm_root_cur
+        _npm_root_cur="$(npm root -g 2>/dev/null)"
+        if [[ -n "$_npm_root_cur" && "$(dirname "$pkg_path")" != "$_npm_root_cur" ]]; then
+            local _warn_prefix
+            _warn_prefix="$(dirname "$(dirname "$(dirname "$pkg_path")")")" 2>/dev/null || true
+            echo -e "  ${YELLOW}⚠ $name 安装在非默认全局前缀: $(dirname "$pkg_path")${NC}"
+            echo -e "    ${YELLOW}当前包管理器 ($pm) 的全局根与安装路径不一致，自动更新会写到错误位置而失效。${NC}"
+            echo -e "    ${YELLOW}该路径可能需 root 权限才能修改；脚本不自动改动，请自行决定如何处理。${NC}"
+            echo -e "    ${BOLD}手动更新到 $expected_ver:${NC}"
+            echo -e "      sudo npm install -g $pkg@$expected_ver --prefix $_warn_prefix"
+            echo -e "      （执行后运行 hash -r 或重启终端）"
+            echo -e "    ${BOLD}或卸载该全局安装:${NC}"
+            echo -e "      sudo npm uninstall -g $pkg --prefix $_warn_prefix"
+            # 在本用户前缀安装（用户确认才执行）：装到当前包管理器的用户级全局根（如 ~/.local），无需 sudo
+            local _inst=()
+            case "$pm" in
+                pnpm) _inst=(pnpm add -g "$pkg@$expected_ver") ;;
+                bun)   _inst=(bun add -g "$pkg@$expected_ver") ;;
+                *)     _inst=(npm install -g "$pkg@$expected_ver") ;;
+            esac
+            echo -e "    ${BOLD}或在本用户前缀安装新版本 ($expected_ver，无需 sudo):${NC}"
+            echo -e "      ${_inst[*]}"
+            echo ""
+            echo -n "  是否在本用户前缀安装新版本 ($expected_ver)？[y/N] "
+            local _ans="n"
+            if [[ -t 0 ]]; then
+                read -r -t 30 _ans || _ans="n"
+            else
+                echo "(非交互模式，跳过)"
+            fi
+            if [[ "$_ans" =~ ^[Yy]$ ]]; then
+                echo -e "  ${BLUE}正在在本用户前缀安装 $name $expected_ver...${NC}"
+                if "${_inst[@]}" 2>&1; then
+                    echo -e "  ${GREEN}✓ 已在本用户前缀安装 $expected_ver${NC}"
+                    # pnpm 不自动运行 postinstall 生命周期脚本，手动执行
+                    if [[ "$pm" == "pnpm" ]]; then
+                        local _pi="$(pnpm root -g 2>/dev/null)/$pkg/postinstall.mjs"
+                        if [[ -f "$_pi" ]]; then
+                            echo -e "  ${BLUE}运行 postinstall（pnpm 默认不执行生命周期脚本）...${NC}"
+                            node "$_pi" 2>&1 || echo -e "  ${YELLOW}⚠ postinstall 执行异常，可手工执行: node $_pi${NC}"
+                        fi
+                    fi
+                    echo -e "  ${YELLOW}注意：系统全局安装 ($pkg_path) 仍可能遮挡本用户版本；${NC}"
+                    echo -e "  ${YELLOW}        若 opencode --version 仍显示旧版本，请卸载系统全局安装或调整 PATH 后执行 hash -r${NC}"
+                else
+                    echo -e "  ${RED}✗ 安装失败，请手工执行: ${_inst[*]}${NC}"
+                fi
+            else
+                echo -e "  ${YELLOW}已跳过自动更新与本用户安装。${NC}"
+            fi
+            return 0
+        fi
+    fi
+
+
     # 根据安装状态显示不同消息
     if [[ -n "$pkg_path" ]]; then
         if [[ "${OMO_PLUGIN_REGISTERED:-0}" == "1" ]]; then
@@ -1668,6 +1811,7 @@ update_package() {
                         echo -e "  ${YELLOW}⚠ 自动清理失败，可手动执行: rm -rf $_npm_root/$OMO_PKG_OLD${NC}"
                 fi
             fi
+            _sync_omo_cache || true
             return 0
         else
             echo -e "${RED}✗ Oh-My-OpenCode 升级失败${NC}"
@@ -1708,7 +1852,6 @@ update_package() {
             if [[ -n "$pkg_path" ]]; then
                 local install_root
                 install_root=$(dirname "$pkg_path")
-                
                 if [[ "$install_root" == "$HOME/.local/lib/node_modules" ]]; then
                     install_cmd=(npm install --prefix "$HOME/.local" -g "$pkg")
                 elif [[ "$install_root" == *"/.bun/"* ]]; then
@@ -1806,6 +1949,14 @@ update_package() {
     done
     
     if [[ "$install_success" == true ]]; then
+        # pnpm 不自动运行 postinstall，手动执行（仅 opencode-ai，OMO 走自己的安装器）
+        if [[ "$pm" == "pnpm" && "$pkg" != "$OMO_PKG_OLD" && "$pkg" != "$OMO_PKG_NEW" ]]; then
+            local _pi="$(pnpm root -g 2>/dev/null)/$pkg/postinstall.mjs"
+            if [[ -f "$_pi" ]]; then
+                echo -e "  ${BLUE}运行 postinstall（pnpm 默认不执行生命周期脚本）...${NC}"
+                node "$_pi" 2>&1 || echo -e "  ${YELLOW}⚠ postinstall 执行异常，可手工执行: node $_pi${NC}"
+            fi
+        fi
         # 验证更新
         sleep 1  # 等待文件系统同步
         
@@ -1907,6 +2058,8 @@ update_package() {
                     chmod +x "$omo_js" 2>/dev/null || true
                     echo -e "  ${BLUE}已自动创建 omo 命令软链接到 $bin_dir${NC}"
                 fi
+                # 同步 OMO 缓存到最新版本（所有包管理器通用）
+                _sync_omo_cache || true
             fi
         fi
     fi
@@ -2678,8 +2831,9 @@ do_auto() {
         echo ""
         echo -e "  ${GREEN}✓ 试运行完成，未执行任何修改${NC}"
     else
-        # 3a. 缓存清理
+        # 3a. 缓存修复
         if [[ "$cache_before" != "ok" ]]; then
+            # 清理旧包名残留
             if _cache_has_old_pkg; then
                 if _cache_clean_old_pkg; then
                     cache_after="cleaned"
@@ -2690,8 +2844,18 @@ do_auto() {
                     cache_status="failed"
                 fi
             fi
-            if [[ "$cache_before" == "mismatch" || "$cache_before" == "old_pkg" ]]; then
-                # 仅清除旧包名后的版本不一致 → 重启 OpenCode 即可
+            # 同步缓存版本（自动，无提示）
+            if [[ "$cache_before" == "mismatch" ]]; then
+                if _sync_omo_cache; then
+                    cache_after="synced"
+                    cache_status="fixed"
+                    action_count=$((action_count + 1))
+                else
+                    echo -e "  ${YELLOW}⚠ 缓存版本同步失败${NC}"
+                    cache_status="failed"
+                fi
+            fi
+            if [[ "$cache_before" == "old_pkg" && "$cache_status" != "failed" ]]; then
                 cache_after="${cache_after:-cleaned}"
                 cache_status="${cache_status:-fixed}"
             fi
@@ -3216,7 +3380,7 @@ show_summary() {
     # --- v1.6.0: 缓存一致性快速检查 ---
     local cache_ver; cache_ver=$(_safe_capture _cache_omo_version)
     if [[ -n "$cache_ver" && "$cache_ver" != "no-cache" && "$cache_ver" != "not-found" && "$omo_ver" != "not-installed" && "$omo_ver" != "plugin-configured" && -n "$omo_ver" && "$cache_ver" != "$omo_ver" ]]; then
-        echo -e "  ${YELLOW}⚠ OMO 缓存版本不一致 (全局 v$omo_ver vs 缓存 v$cache_ver) — 运行 oc-update config 查看详情${NC}"
+        echo -e "  ${YELLOW}⚠ OMO 缓存版本不一致 (全局 v$omo_ver vs 缓存 v$cache_ver) — 运行 oc-update config --fix 修复${NC}"
     elif _cache_has_old_pkg 2>/dev/null; then
         echo -e "  ${YELLOW}⚠ 缓存中存在旧包名 $OMO_PKG_OLD — 运行 oc-update config 查看详情${NC}"
     fi
@@ -3258,6 +3422,7 @@ Commands:
   disable [oc|omo|all]           禁用自动更新检查
   enable [oc|omo|all]            启用自动更新检查
   config                         显示当前配置及缓存健康检查
+  config --fix                   自动修复 OMO 缓存版本不一致
   version                        显示当前oc-update版本号
   help                           显示帮助信息
 
@@ -3350,7 +3515,15 @@ main() {
             do_enable "${1:-all}"
             ;;
         config)
-            show_config
+            if [[ "$target_ver" == "--fix" ]]; then
+                echo -e "${BOLD}OMO 缓存修复:${NC}"
+                _cache_clean_old_pkg
+                _sync_omo_cache
+                echo ""
+                echo -e "${BLUE}💡 请重启 OpenCode 以使用最新 OMO 插件${NC}"
+            else
+                show_config
+            fi
             ;;
         -h|--help)
             show_help

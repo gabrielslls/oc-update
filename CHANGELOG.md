@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-07-15
+
+### Fixed (Root Cause)
+- **OMO 缓存版本不一致的根源**: OpenCode 从 `~/.cache/opencode/node_modules/` 加载 OMO 插件，
+  但 `oc-update` 只更新全局安装。缓存同步是可选提示（y/N，30s超时默认N），导致用户升级后
+  OpenCode 仍使用旧版本。详见 `docs/FAQ.md`。
+
+### Changed
+- **`_prompt_sync_omo_cache` → `_sync_omo_cache`**: 替换为自动同步（无提示），
+  使用精确版本号（`oh-my-openagent@4.18.1`）而非 `@latest`，避免 registry tag 漂移
+- **缓存同步覆盖所有更新路径**: 不再限于 bun 分支，npm/pnpm/yarn 更新 OMO 后也会自动同步缓存
+- **`config --fix` 子命令**: 新增 `oc-update config --fix` 一键修复缓存版本不一致 + 清理旧包名
+- **`do_auto` Stage 3 自动修复**: 自动维护模式下缓存版本不一致也会自动修复
+
+### Added
+- **`OC_NO_CACHE_SYNC=1` 环境变量**: 允许跳过自动缓存同步
+- **同步后版本验证**: `_sync_omo_cache` 执行后验证缓存版本是否确实更新到目标版本
+- **不降级保护**: 缓存版本比全局新时跳过同步（防止用户手动升级缓存后被降级）
+- **缓存初始化检查**: 缓存无 `package.json`/`bun.lock` 时跳过同步
+
 ## [1.8.0] - 2026-06-10
 
 ### Added
